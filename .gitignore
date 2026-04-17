@@ -1,0 +1,13 @@
+# Arduino
+*.hex
+*.elf
+*.bin
+build/
+libraries/
+
+# Secrets
+GeminiAssistant/config.h
+
+# OS
+.DS_Store
+Thumbs.db
