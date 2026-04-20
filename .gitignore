@@ -1,9 +1,13 @@
-# Arduino
+# Arduino build artifacts
 *.hex
 *.elf
 *.bin
+*.map
 build/
-libraries/
+GeminiAssistant/build/
+
+# Local binaries
+bin/
 
 # Secrets
 GeminiAssistant/config.h
