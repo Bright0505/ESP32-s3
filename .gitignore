@@ -1,17 +1,4 @@
-# Arduino build artifacts
-*.hex
-*.elf
-*.bin
-*.map
 build/
-GeminiAssistant/build/
-
-# Local binaries
-bin/
-
-# Secrets
+log.txt
+GeminiAssistant/sketch.yaml
 GeminiAssistant/config.h
-
-# OS
-.DS_Store
-Thumbs.db

@@ -1,4 +1,5 @@
 #include <Arduino_GFX_Library.h>
+#include <vector>
 #include <Adafruit_GFX.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -7,24 +8,10 @@
 #include <Wire.h>
 #include <SD.h>
 #include <SPI.h>
-#include <driver/i2s.h>
-#include <mbedtls/base64.h>
 #include "OpenFontRender.h"
 #include "ofrfs/M5Stack_SD_Preset.h"
 #include "XPowersLib.h"
 #include "config.h"
-
-/* ── 麥克風（ES7210 + I2S）─────────────────────────────── */
-#define MIC_BCLK        9
-#define MIC_WS         45
-#define MIC_DIN        10
-#define MIC_MCLK       42
-#define ES7210_ADDR  0x40
-#define I2S_PORT    I2S_NUM_0
-#define SAMPLE_RATE 16000
-#define MAX_REC_SEC     4
-#define AUDIO_BUF_SIZE  (MAX_REC_SEC * SAMPLE_RATE * 2)   // 128KB mono 16-bit
-#define WAV_HDR_SIZE   44
 
 /* Display (QSPI) */
 #define LCD_SDIO0  4
@@ -62,6 +49,13 @@ OpenFontRender render;
 SPIClass sdSPI(HSPI);
 bool fontLoaded = false;
 GFXcanvas16 *msgCanvas = nullptr;
+
+// 待機貓咪動畫
+static int      gCatFrame     = 0;
+static uint32_t gLastCatFrame = 0;
+static bool     gIdleMode     = true;   // false = 正在顯示結果，暫停動畫
+static uint32_t gResultTime   = 0;      // 上次顯示結果的時間
+#define IDLE_TIMEOUT_MS 60000           // 1 分鐘後回到待機動畫
 
 // ── 開機狀態面板（全置中版面）──────────────────────────
 // textSize=2: 12×16px；每行佔 60px（label+detail+padding）
@@ -148,7 +142,7 @@ void setRowStatus(int row, BootStatus s, const char* detail = "") {
 }
 
 void setProgress(const char* msg) {
-    gfx->fillRect(10, ROW_MSG, DISPLAY_W - 20, DISPLAY_H - ROW_MSG - 10, 0x0000);
+    gfx->fillRect(0, ROW_MSG, DISPLAY_W, DISPLAY_H - ROW_MSG - 10, 0x0000);
     gfx->setTextColor(0x07FF);
     gfx->setTextSize(2);
     gfx->setCursor(cx(msg), ROW_MSG);
@@ -156,7 +150,7 @@ void setProgress(const char* msg) {
 }
 
 void setProgress2(const char* line1, const char* line2) {
-    gfx->fillRect(10, ROW_MSG, DISPLAY_W - 20, DISPLAY_H - ROW_MSG - 10, 0x0000);
+    gfx->fillRect(0, ROW_MSG, DISPLAY_W, DISPLAY_H - ROW_MSG - 10, 0x0000);
     gfx->setTextColor(0x07FF);
     gfx->setTextSize(2);
     gfx->setCursor(cx(line1), ROW_MSG);
@@ -167,33 +161,47 @@ void setProgress2(const char* line1, const char* line2) {
 
 // ── 字型下載（WiFi 已連線才呼叫）───────────────────────
 bool downloadFont() {
-    // 依序嘗試多個來源（正確檔名：LXGWWenKai-Regular.ttf，無 TC）
+    // PSRAM 8MB，字型檔需 ≤7MB（OpenFontRender 會將整個字型載入 PSRAM）
+    // FreeType error 0x40 = Out of Memory
     const char* urls[] = {
-        "https://github.com/lxgw/LxgwWenKai/releases/download/v1.522/LXGWWenKai-Regular.ttf",
-        "https://github.com/lxgw/LxgwWenKai/releases/download/v1.500/LXGWWenKai-Regular.ttf",
-        "https://github.com/lxgw/LxgwWenKai/releases/download/v1.330/LXGWWenKai-Regular.ttf",
+        // WenQuanYi Micro Hei (~3.5MB)，繁簡中文皆支援，最小且可靠
+        "https://github.com/anthonyfok/fonts-wqy-microhei/raw/master/wqy-microhei.ttc",
+        // LXGW WenKai TC 備用（若未來有 ≤7MB 版本）
+        "https://cdn.jsdelivr.net/gh/lxgw/LxgwWenKai@1.330/fonts/TTF/LXGWWenKaiTC-Regular.ttf",
+        "https://raw.githubusercontent.com/lxgw/LxgwWenKai/1.330/fonts/TTF/LXGWWenKaiTC-Regular.ttf",
     };
 
     int code = 0;
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(30);
+    client.setTimeout(20);  // TLS 握手上限 20 秒
 
-    for (int u = 0; u < 3; u++) {
-        setProgress2(urls[u] + 8, "Connecting...");  // 跳過 "https://"
+    int urlCount = sizeof(urls) / sizeof(urls[0]);
+    for (int u = 0; u < urlCount; u++) {
+        char connMsg[24];
+        snprintf(connMsg, sizeof(connMsg), "Connecting %d/%d...", u + 1, urlCount);
+        setProgress2(urls[u] + 8, connMsg);
         Serial.printf("Try %d: %s\n", u+1, urls[u]);
         http.begin(client, urls[u]);
         http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-        http.setTimeout(60000);
+        http.setTimeout(30000);
         code = http.GET();
-        Serial.printf("HTTP %d  size=%d\n", code, http.getSize());
-        if (code == 200) break;
-        // 顯示錯誤碼（大字）
+        int sz = http.getSize();
+        Serial.printf("HTTP %d  size=%d\n", code, sz);
+        if (code == 200) {
+            if (sz > 7 * 1024 * 1024) {
+                Serial.printf("Font too large (%dMB > 7MB PSRAM limit), skipping\n", sz / 1024 / 1024);
+                http.end();
+                code = 0;
+                continue;
+            }
+            break;
+        }
         gfx->fillRect(0, 350, DISPLAY_W, 100, 0x0000);
         gfx->setTextColor(0xF800); gfx->setTextSize(3);
         gfx->setCursor(20, 360);
-        gfx->printf("HTTP %d  src%d/3", code, u+1);
+        gfx->printf("HTTP %d  src%d/%d", code, u+1, urlCount);
         http.end();
         delay(1000);
     }
@@ -204,6 +212,17 @@ bool downloadFont() {
     }
 
     int total = http.getSize();
+
+    // SD 空間確認
+    uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+    Serial.printf("SD free: %llu bytes, need: %d bytes\n", freeBytes, total);
+    if (total > 0 && freeBytes < (uint64_t)total) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "SD full: %lluMB free", freeBytes / (1024*1024));
+        setRowStatus(ROW_FONT, BS_FAIL, msg);
+        http.end(); return false;
+    }
+
     if (SD.exists(FONT_PATH)) SD.remove(FONT_PATH);
     File f = SD.open(FONT_PATH, FILE_WRITE);
     if (!f) {
@@ -215,38 +234,107 @@ bool downloadFont() {
     static uint8_t buf[4096];
     int downloaded = 0;
     uint32_t lastDraw = 0;
+    uint32_t lastRecv = millis();
 
-    while (http.connected() || stream->available()) {
+    while (true) {
+        if (total > 0 && downloaded >= total) break;
         int avail = stream->available();
         if (avail > 0) {
             int n = stream->readBytes(buf, min(avail, (int)sizeof(buf)));
-            f.write(buf, n);
-            downloaded += n;
-            if (millis() - lastDraw > 400) {
-                lastDraw = millis();
-                char prog[48];
-                if (total > 0)
-                    snprintf(prog, sizeof(prog), "%d%% (%dKB / %dKB)", downloaded*100/total, downloaded/1024, total/1024);
-                else
-                    snprintf(prog, sizeof(prog), "%dKB downloaded", downloaded/1024);
-                setProgress2("Downloading font...", prog);
-                Serial.println(prog);
+            if (n > 0) {
+                size_t written = f.write(buf, n);
+                if ((int)written != n) {
+                    Serial.printf("SD write failed: wrote %u of %d (disk full?)\n", written, n);
+                    f.close(); http.end();
+                    setRowStatus(ROW_FONT, BS_FAIL, "SD write failed");
+                    return false;
+                }
+                downloaded += n;
+                lastRecv = millis();
+                if (millis() - lastDraw > 400) {
+                    lastDraw = millis();
+                    char prog[48];
+                    if (total > 0)
+                        snprintf(prog, sizeof(prog), "%d%% (%dKB / %dKB)", (int)((int64_t)downloaded*100/total), downloaded/1024, total/1024);
+                    else
+                        snprintf(prog, sizeof(prog), "%dKB downloaded", downloaded/1024);
+                    setProgress2("Downloading font...", prog);
+                    Serial.println(prog);
+                }
             }
         } else {
-            if (!http.connected()) break;
+            if (millis() - lastRecv > 30000) { Serial.println("Download stall 30s, giving up"); break; }
             delay(10);
         }
     }
+    f.flush();
     f.close();
     http.end();
+    setProgress2("Downloading font...", "100% - Verifying...");
     Serial.printf("Downloaded %d bytes\n", downloaded);
 
-    if (downloaded < 1000) {
+    // 驗證 SD 實際寫入大小，避免 flush 不完整留下空檔案
+    File verify = SD.open(FONT_PATH, FILE_READ);
+    uint32_t actualSize = verify ? verify.size() : 0;
+    if (verify) verify.close();
+    Serial.printf("SD verify size: %u bytes\n", actualSize);
+
+    // 下載不完整視為失敗（Content-Length 未知時要求至少 1MB）
+    bool incomplete = (total > 0) ? (actualSize < (uint32_t)(total * 0.99)) : (actualSize < 1024 * 1024);
+    if (incomplete) {
+        Serial.printf("Incomplete: SD=%u expected=%d\n", actualSize, total);
         SD.remove(FONT_PATH);
         setRowStatus(ROW_FONT, BS_FAIL, "Incomplete download");
         return false;
     }
     return true;
+}
+
+// ── 待機貓咪動畫 ──────────────────────────────────────────
+// textSize=3 → 每字 18×24px；11字 × 18 = 198px wide；catX=(466-198)/2=134
+void drawIdleCat(int frame) {
+    // 10 幀循環：REST / BLINK / REST / EAR_L / REST / EAR_R / REST / GROOM / REST / TAIL
+    static const char* FRAMES[10][5] = {
+        { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 0 REST
+        { "           ", "   /\\_/\\   ", "  ( - - )  ", "  (  w  )  ", "  (\")_(\")" },  // 1 BLINK
+        { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 2 REST
+        { "           ", "   <\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 3 EAR_L
+        { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 4 REST
+        { "           ", "   /\\_/>   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 5 EAR_R
+        { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 6 REST
+        { "           ", "   /\\_/\\   ", "  ( ^ ^ )  ", "  (  P  )  ", "  (\")_(\")" },  // 7 GROOM
+        { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 8 REST
+        { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", " ~(\")_(\")" },  // 9 TAIL
+    };
+
+    if (!msgCanvas) {
+        msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
+        if (!msgCanvas->getBuffer()) { delete msgCanvas; msgCanvas = nullptr; return; }
+    }
+    msgCanvas->fillScreen(0x0000);
+
+    const int CAT_CHAR_W = 18, CAT_CHAR_H = 24, CAT_COLS = 11, CAT_ROWS = 5;
+    int catX = (DISPLAY_W - CAT_CHAR_W * CAT_COLS) / 2; // 134
+    int catY = 155;
+
+    msgCanvas->setTextSize(3);
+    msgCanvas->setTextColor(0xFD20); // 橘黃
+    msgCanvas->setTextWrap(false);
+    for (int i = 0; i < CAT_ROWS; i++) {
+        msgCanvas->setCursor(catX, catY + i * CAT_CHAR_H);
+        msgCanvas->print(FRAMES[frame][i]);
+    }
+
+    // 底部提示（textSize=2，白色，置中）
+    const char* hint = "Press BOOT to draw";
+    int hx = (DISPLAY_W - (int)strlen(hint) * 12) / 2;
+    msgCanvas->setTextSize(2);
+    msgCanvas->setTextColor(0x8410); // 暗灰
+    msgCanvas->setCursor(hx, 310);
+    msgCanvas->print(hint);
+
+    blitCanvas();
+    drawWifiIcon();
 }
 
 // 快速狀態文字（內建字型，無 OFR，瞬間顯示）
@@ -261,43 +349,170 @@ void quickMsg(const char* msg, uint16_t color = 0x07FF) {
 }
 
 // ── 主顯示函式（canvas buffer → blit）──────────────────
+// 將一段文字依照顯示寬度拆成多行（UTF-8 aware）
+// Returns true if the 3-byte UTF-8 sequence at seg[j] is a line-start-forbidden punctuation
+// (避頭禁則：。、！？）」』】…～)
+static bool isKinsoku(const String& seg, int j) {
+    if (j + 2 >= (int)seg.length()) return false;
+    uint8_t b0 = seg[j], b1 = seg[j+1], b2 = seg[j+2];
+    if (b0 == 0xE3) {
+        if (b1 == 0x80 && (b2 == 0x82 || b2 == 0x81)) return true; // 。、
+        if (b1 == 0x80 && (b2 == 0x8D || b2 == 0x8F || b2 == 0x8B)) return true; // 」』】
+        if (b1 == 0x80 && b2 == 0xBB) return true; // …
+    }
+    if (b0 == 0xEF && b1 == 0xBC) {
+        if (b2 == 0x81 || b2 == 0x9F || b2 == 0x89) return true; // ！？）
+    }
+    if (b0 == 0xEF && b1 == 0xBD && b2 == 0x9E) return true; // ～
+    return false;
+}
+
+void wrapSegment(const String& seg, std::vector<String>& out, int maxW = DISPLAY_W - 10) {
+    if (seg.length() == 0) { out.push_back(""); return; }
+    String cur = "";
+    int j = 0;
+    while (j < (int)seg.length()) {
+        uint8_t c = (uint8_t)seg[j];
+        int cl = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+        String next = cur + seg.substring(j, j + cl);
+        if (render.getTextWidth("%s", next.c_str()) > maxW && cur.length() > 0) {
+            // Kinsoku: don't leave sentence-end punctuation at start of next line
+            if (cl == 3 && isKinsoku(seg, j)) {
+                out.push_back(next); // attach punctuation to current line even if slightly wide
+                cur = "";
+            } else {
+                out.push_back(cur);
+                cur = seg.substring(j, j + cl);
+            }
+        } else {
+            cur = next;
+        }
+        j += cl;
+    }
+    if (cur.length() > 0) out.push_back(cur);
+}
+
 void displayMessage(String text, uint16_t color) {
-    // 不在開頭清屏，避免黑屏閃爍；canvas 本身是黑底，blit 時一次替換
     if (!fontLoaded) { Serial.println(text); return; }
 
-    // 第一次使用時建立全螢幕 canvas（PSRAM 分配）
+    // Merge punctuation that Gemini placed on its own line back to the previous line
+    text.replace("\n。", "。");
+    text.replace("\n、", "、");
+    text.replace("\n！", "！");
+    text.replace("\n？", "？");
+    text.replace("\n）", "）");
+    text.replace("\n」", "」");
+    text.replace("\n』", "』");
+
     if (!msgCanvas) {
         msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
         if (!msgCanvas->getBuffer()) { delete msgCanvas; msgCanvas = nullptr; return; }
     }
     msgCanvas->fillScreen(0x0000);
-
     render.setDrawer(*msgCanvas);
     render.setFontSize(FONT_SIZE);
 
-    int lineCount = 1;
-    for (char c : text) if (c == '\n') lineCount++;
-    int lineH = FONT_SIZE + 12;
-    int y = max(FONT_SIZE, (DISPLAY_H - lineCount * lineH) / 2 + FONT_SIZE);
-    int lineStart = 0;
-
+    // 先拆行（\n 顯式換行 + 自動換行）
+    std::vector<String> lines;
+    int start = 0;
     for (int i = 0; i <= (int)text.length(); i++) {
         if (i == (int)text.length() || text[i] == '\n') {
-            String line = text.substring(lineStart, i);
-            if (line.length() > 0) {
-                int32_t lw = render.getTextWidth("%s", line.c_str());
-                int32_t x = max((int32_t)0, ((int32_t)DISPLAY_W - lw) / 2);
-                render.setCursor(x, y);
-                render.setFontColor(color, 0x0000);
-                render.setAlignment(Align::TopLeft);
-                render.printf("%s", line.c_str());
-            }
-            y += lineH;
-            lineStart = i + 1;
+            wrapSegment(text.substring(start, i), lines);
+            start = i + 1;
         }
     }
 
-    // Blit canvas（含軟體旋轉）
+    int lineH = FONT_SIZE + 12;
+    int y = max(FONT_SIZE, (DISPLAY_H - (int)lines.size() * lineH) / 2);
+
+    for (auto& line : lines) {
+        if (line.length() > 0) {
+            int32_t lw = render.getTextWidth("%s", line.c_str());
+            int32_t x = max((int32_t)0, ((int32_t)DISPLAY_W - lw) / 2);
+            render.setCursor(x, y);
+            render.setFontColor(color, 0x0000);
+            render.setAlignment(Align::TopLeft);
+            render.printf("%s", line.c_str());
+        }
+        y += lineH;
+    }
+
+    blitCanvas();
+    drawWifiIcon();
+}
+
+// ── Buddy 對話框顯示 ─────────────────────────────────────
+// cat: 5 行 ASCII art（等寬，每字 12px，每行 12 字）
+void displayBuddyMessage(const char* cat[5], String text) {
+    if (!fontLoaded) { Serial.println(text); return; }
+
+    if (!msgCanvas) {
+        msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
+        if (!msgCanvas->getBuffer()) { delete msgCanvas; msgCanvas = nullptr; return; }
+    }
+    msgCanvas->fillScreen(0x0000);
+    render.setDrawer(*msgCanvas);
+
+    // ① 上方：ASCII 貓咪（Adafruit GFX bitmap 等寬字型，textSize=2 → 12×16px/字）
+    // 字串實際 11 字元寬，以此計算置中 x
+    const int CAT_CHAR_W = 12, CAT_CHAR_H = 16, CAT_COLS = 11, CAT_ROWS = 5;
+    int catX = (DISPLAY_W - CAT_CHAR_W * CAT_COLS) / 2; // (466-132)/2 = 167
+    int catY = 82;
+    msgCanvas->setTextSize(2);
+    msgCanvas->setTextColor(0xFD20); // 橘黃色
+    msgCanvas->setTextWrap(false);
+    for (int i = 0; i < CAT_ROWS; i++) {
+        msgCanvas->setCursor(catX, catY + i * CAT_CHAR_H);
+        msgCanvas->print(cat[i]);
+    }
+
+    // ② 下方：對話框（3 行文字）
+    const int BOX_X = 18, BOX_Y = 175, BOX_W = 430, BOX_H = 155, BOX_R = 18;
+    const int TEXT_X = BOX_X + 18, TEXT_MAX_W = BOX_W - 36;
+    const int BUDDY_FONT = 28;
+    render.setFontSize(BUDDY_FONT);
+
+    // 合併孤立標點
+    text.replace("\n。", "。"); text.replace("\n、", "、");
+    text.replace("\n！", "！"); text.replace("\n？", "？");
+
+    // 折行
+    std::vector<String> lines;
+    int start = 0;
+    for (int i = 0; i <= (int)text.length(); i++) {
+        if (i == (int)text.length() || text[i] == '\n') {
+            wrapSegment(text.substring(start, i), lines, TEXT_MAX_W);
+            start = i + 1;
+        }
+    }
+
+    // 對話框框線（白色）
+    msgCanvas->drawRoundRect(BOX_X, BOX_Y, BOX_W, BOX_H, BOX_R, 0xFFFF);
+    msgCanvas->drawRoundRect(BOX_X+1, BOX_Y+1, BOX_W-2, BOX_H-2, BOX_R, 0xC618); // 內層淡色
+
+    // 文字渲染（靠左對齊、整體垂直置中於對話框）
+    int lineH = BUDDY_FONT + 10;
+    // 計算可顯示行數，再由此決定垂直起始位置
+    int visibleLines = 0;
+    for (auto& line : lines) {
+        if (BOX_Y + 10 + (visibleLines + 1) * lineH > BOX_Y + BOX_H - 10) break;
+        visibleLines++;
+    }
+    int totalTextH = visibleLines * lineH;
+    int y = BOX_Y + (BOX_H - totalTextH) / 2;
+    int rendered = 0;
+    for (auto& line : lines) {
+        if (rendered >= visibleLines) break;
+        if (line.length() > 0) {
+            render.setCursor(TEXT_X, y);
+            render.setFontColor(0xFFFF, 0x0000);
+            render.setAlignment(Align::TopLeft);
+            render.printf("%s", line.c_str());
+        }
+        y += lineH;
+        rendered++;
+    }
+
     blitCanvas();
     drawWifiIcon();
 }
@@ -338,187 +553,34 @@ void blitCanvas() {
     heap_caps_free(dst);
 }
 
-// ── WiFi 狀態圖示 ────────────────────────────────────────
+// ── WiFi 狀態圖示（小圓點：紅/黃/綠）───────────────────
 void drawWifiIcon() {
-    const int X0 = 328, Y0 = 95;
-    const int BW = 7, GAP = 4;
-    const int HEIGHTS[] = { 8, 14, 20, 26 };
+    const int CX = 448, CY = 20, R = 7;
 
     wl_status_t status = WiFi.status();
-    bool connected   = (status == WL_CONNECTED);
-    bool connecting  = (status == WL_DISCONNECTED || status == WL_IDLE_STATUS);
+    bool connected  = (status == WL_CONNECTED);
+    bool connecting = (status == WL_DISCONNECTED || status == WL_IDLE_STATUS);
 
-    int bars = 0;
-    if (connected) {
-        int32_t rssi = WiFi.RSSI();
-        if      (rssi >= -55) bars = 4;
-        else if (rssi >= -65) bars = 3;
-        else if (rssi >= -75) bars = 2;
-        else                  bars = 1;
-    }
-
-    gfx->fillRect(X0 - 2, Y0 - 30, (BW + GAP) * 4 + 4, 34, 0x0000);
-
-    for (int i = 0; i < 4; i++) {
-        int bx = X0 + i * (BW + GAP);
-        int bh = HEIGHTS[i];
-        int by = Y0 - bh;
-        uint16_t color;
-        if (connecting)        color = (millis() / 400 % 2) ? 0xFFE0 : 0x2945; // 黃色閃爍
-        else if (!connected)   color = 0xF800;                                   // 紅：斷線
-        else if (i < bars)     color = (bars >= 3) ? 0x07E0 : 0xFFE0;           // 綠/黃
-        else                   color = 0x2945;                                   // 暗灰
-        gfx->fillRect(bx, by, BW, bh, color);
-    }
-}
-
-// ── ES7210 & I2S 麥克風 ──────────────────────────────────
-static void es7210_reg(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(ES7210_ADDR);
-    Wire.write(reg); Wire.write(val);
-    Wire.endTransmission();
-}
-
-void initES7210() {
-    es7210_reg(0x00, 0xFF); delay(20);   // Reset
-    es7210_reg(0x00, 0x32);              // Normal
-    es7210_reg(0x01, 0x20);              // I2S 16-bit
-    es7210_reg(0x02, 0x04);              // MCLK = 256*LRCK
-    es7210_reg(0x03, 0x00);
-    es7210_reg(0x06, 0x00);
-    es7210_reg(0x07, 0x20);
-    es7210_reg(0x08, 0x10);
-    es7210_reg(0x11, 0xFF);
-    es7210_reg(0x12, 0x68);
-    es7210_reg(0x40, 0x43);              // MIC1 gain +30dB
-    es7210_reg(0x41, 0x43);              // MIC2 gain +30dB
-    es7210_reg(0x43, 0x10);
-    es7210_reg(0x44, 0x10);
-    es7210_reg(0x45, 0x10);
-    es7210_reg(0x46, 0x10);
-    Serial.println("ES7210 init done");
-}
-
-void initMicI2S() {
-    i2s_config_t cfg = {
-        .mode             = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate      = SAMPLE_RATE,
-        .bits_per_sample  = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format   = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count    = 8,
-        .dma_buf_len      = 512,
-        .use_apll         = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk       = SAMPLE_RATE * 256
-    };
-    i2s_pin_config_t pins = {
-        .mck_io_num    = MIC_MCLK,
-        .bck_io_num    = MIC_BCLK,
-        .ws_io_num     = MIC_WS,
-        .data_out_num  = I2S_PIN_NO_CHANGE,
-        .data_in_num   = MIC_DIN
-    };
-    i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
-    i2s_set_pin(I2S_PORT, &pins);
-    Serial.println("I2S mic init done");
-}
-
-void buildWAVHeader(uint8_t* h, uint32_t audioBytes) {
-    uint32_t fileSize = audioBytes + 36;
-    uint32_t sr       = SAMPLE_RATE;
-    uint32_t byteRate = sr * 2;
-    uint16_t ch=1, fmt=1, align=2, bps=16, fmtSz=16;
-    memcpy(h,    "RIFF", 4); memcpy(h+4,  &fileSize, 4);
-    memcpy(h+8,  "WAVE", 4); memcpy(h+12, "fmt ", 4);
-    memcpy(h+16, &fmtSz, 4); memcpy(h+20, &fmt,   2);
-    memcpy(h+22, &ch,    2);  memcpy(h+24, &sr,    4);
-    memcpy(h+28, &byteRate,4);memcpy(h+32, &align, 2);
-    memcpy(h+34, &bps,   2);  memcpy(h+36, "data", 4);
-    memcpy(h+40, &audioBytes, 4);
-}
-
-void askGeminiVoice() {
-    quickMsg("Recording...", 0xF800);
-
-    // 分配錄音緩衝區（純 PCM，不含 WAV header）
-    uint8_t* pcm = (uint8_t*)heap_caps_malloc(AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (!pcm) { quickMsg("PSRAM error", 0xF800); return; }
-
-    size_t total = 0, got = 0;
-    while (digitalRead(0) == LOW && total < AUDIO_BUF_SIZE) {
-        i2s_read(I2S_PORT, pcm + total,
-                 min((size_t)1024, AUDIO_BUF_SIZE - total), &got, 100);
-        total += got;
-    }
-    Serial.printf("Recorded %u bytes PCM\n", total);
-
-    if (total < 2000) {
-        heap_caps_free(pcm);
-        quickMsg("Too short!", 0xF800);
-        delay(2000);
-        return;
-    }
-
-    quickMsg("Processing...", 0x07FF);
-
-    // Base64 編碼（PSRAM）
-    size_t b64Sz = ((total + 2) / 3) * 4 + 1;
-    uint8_t* b64 = (uint8_t*)heap_caps_malloc(b64Sz, MALLOC_CAP_SPIRAM);
-    if (!b64) { heap_caps_free(pcm); quickMsg("PSRAM error", 0xF800); return; }
-    size_t b64Len = 0;
-    mbedtls_base64_encode(b64, b64Sz, &b64Len, pcm, total);
-    heap_caps_free(pcm);
-    b64[b64Len] = '\0';
-
-    // 組 JSON：使用 audio/l16 raw PCM（不需要 WAV header）
-    const char* pre = "{\"contents\":[{\"parts\":[{\"inline_data\":{\"mime_type\":\"audio/l16;rate=16000\",\"data\":\"";
-    const char* suf = "\"}},{\"text\":\"請理解語音內容並用繁體中文回答，100字內\"}]}]}";
-    size_t jsonSz = strlen(pre) + b64Len + strlen(suf) + 1;
-    char* json = (char*)heap_caps_malloc(jsonSz, MALLOC_CAP_SPIRAM);
-    if (!json) { heap_caps_free(b64); quickMsg("PSRAM error", 0xF800); return; }
-    strcpy(json, pre);
-    strcat(json, (char*)b64);
-    strcat(json, suf);
-    heap_caps_free(b64);
-
-    WiFiClientSecure client; client.setInsecure(); client.setTimeout(30);
-    HTTPClient http;
-    http.begin(client, "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=" + String(apiKey));
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(30000);
-
-    int code = http.POST((uint8_t*)json, strlen(json));
-    heap_caps_free(json);
-    Serial.printf("Voice API: %d\n", code);
-
-    if (code == 200) {
-        String resp = http.getString();
-        DynamicJsonDocument doc(32768);
-        if (!deserializeJson(doc, resp)) {
-            displayMessage(String(doc["candidates"][0]["content"]["parts"][0]["text"].as<const char*>()), 0xFFFF);
-        } else {
-            displayMessage("解析錯誤", 0xF800);
-        }
+    uint16_t color;
+    if (connecting) {
+        color = (millis() / 400 % 2) ? 0xFFE0 : 0x0000; // 黃色閃爍
+    } else if (!connected) {
+        color = 0xF800; // 紅：斷線
     } else {
-        // 顯示詳細錯誤
-        String body = http.getString();
-        Serial.println(body);
-        // 從 error.message 擷取
-        DynamicJsonDocument errDoc(2048);
-        String errMsg = "HTTP " + String(code);
-        if (!deserializeJson(errDoc, body) && errDoc.containsKey("error"))
-            errMsg = errDoc["error"]["message"].as<String>().substring(0, 40);
-        displayMessage("語音錯誤\n" + errMsg, 0xF800);
+        int32_t rssi = WiFi.RSSI();
+        color = (rssi >= -65) ? 0x07E0 : 0xFFE0; // 綠：強訊號  黃：弱訊號
     }
-    http.end();
-    drawWifiIcon();
+
+    gfx->fillCircle(CX, CY, R, 0x0000);   // 清除
+    gfx->fillCircle(CX, CY, R, color);
 }
 
 // ── Setup ───────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
+    // 等待 USB-CDC terminal 連線（最多 3 秒），確保 Serial 輸出不遺失
+    uint32_t t0 = millis();
+    while (!Serial && millis() - t0 < 3000) delay(10);
 
     Wire.begin(IIC_SDA, IIC_SCL);
     Wire.beginTransmission(0x34); Wire.write(0x90); Wire.write(0xBF); Wire.endTransmission();
@@ -583,60 +645,86 @@ void setup() {
         }
     }
 
-    // 顯示字型檔資訊
+    // 顯示字型檔資訊，零位元組直接刪除重下（避免 loadFont 卡死）
     File fi = SD.open(FONT_PATH, FILE_READ);
     uint32_t fsize = fi ? fi.size() : 0;
     if (fi) fi.close();
-    char finfo[48];
-    snprintf(finfo, sizeof(finfo), "File: %luKB", fsize / 1024);
-    setProgress(finfo);
     Serial.printf("Font file size: %lu bytes\n", fsize);
-    delay(1000);
+    Serial.flush();
 
-    render.setDrawer(*gfx);
-    int fontErr = render.loadFont(FONT_PATH);
-    if (fontErr != 0) {
-        Serial.printf("Font load failed FT error: %d, deleting and re-downloading\n", fontErr);
+    if (fsize < 1000) {
         SD.remove(FONT_PATH);
         setRowStatus(ROW_FONT, BS_FAIL, "Bad font, re-downloading...");
-        delay(1000);
+        Serial.println("Font too small, re-downloading");
+        if (!wifiOk) { while (true) delay(1000); }
         if (!downloadFont()) {
             setProgress("Press BOOT to retry");
             while (digitalRead(0) != LOW) delay(100);
             ESP.restart();
         }
-        fontErr = render.loadFont(FONT_PATH);
-        if (fontErr != 0) {
-            char errMsg[40];
-            snprintf(errMsg, sizeof(errMsg), "FT error: %d (%luKB)", fontErr, fsize/1024);
-            setRowStatus(ROW_FONT, BS_FAIL, errMsg);
-            Serial.printf("Font load failed again: %d\n", fontErr);
-            while (true) delay(1000);
-        }
+        fi = SD.open(FONT_PATH, FILE_READ);
+        fsize = fi ? fi.size() : 0;
+        if (fi) fi.close();
+        Serial.printf("Re-downloaded font size: %lu bytes\n", fsize);
+        Serial.flush();
+    }
+
+    char finfo[48];
+    snprintf(finfo, sizeof(finfo), "File: %luKB", fsize / 1024);
+    setProgress(finfo);
+    delay(500);
+
+    render.setDrawer(*gfx);
+    Serial.printf("Free internal heap: %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    Serial.printf("Free PSRAM:         %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.printf("Loading font from SD (%luKB)...\n", fsize / 1024);
+    Serial.flush();
+    int fontErr = render.loadFont(FONT_PATH);
+    Serial.printf("render.loadFont returned: %d\n", fontErr);
+    Serial.flush();
+    if (fontErr != 0) {
+        // 字型載入失敗：刪除後讓用戶手動按 BOOT 重啟重下
+        // 不自動重試，避免無限下載循環
+        char errMsg[48];
+        snprintf(errMsg, sizeof(errMsg), "FT err %d  %luKB", fontErr, fsize / 1024);
+        setRowStatus(ROW_FONT, BS_FAIL, errMsg);
+        setProgress("Delete & BOOT to retry");
+        Serial.printf("Font load failed: FT error %d, file %lu bytes\n", fontErr, fsize);
+        Serial.flush();
+        SD.remove(FONT_PATH);  // 刪掉，下次開機重下
+        while (digitalRead(0) != LOW) delay(100);
+        ESP.restart();
     }
     fontLoaded = true;
     setRowStatus(ROW_FONT, BS_OK, "LXGWWenKaiTC");
-    setProgress("Boot complete!");
-    Serial.println("Font OK — boot complete");
-    delay(1500);
+    setProgress("Press BOOT to start");
+    Serial.println("Font OK — waiting for BOOT button");
+    while (digitalRead(0) != LOW) delay(50);
+    while (digitalRead(0) == LOW)  delay(50);  // 等放開
 
-    // ── 初始化麥克風 ──
-    initES7210();
-    initMicI2S();
-
-    // ── 正常啟動 ──
-    displayMessage("連線成功！\n短按：文字  長按：語音", 0xFFFF);
+    // ── 立即顯示主待機畫面（按鍵說明）──
+    drawIdleCat(0);
 }
 
 // ── Loop ────────────────────────────────────────────────
 void loop() {
-    // 每秒更新圖示；每 10 秒嘗試重連
-    static uint32_t lastIconUpdate = 0;
-    static uint32_t lastReconnect  = 0;
-    if (millis() - lastIconUpdate > 1000) {
-        lastIconUpdate = millis();
-        drawWifiIcon();
+    // 結果顯示中：1 分鐘無操作後回到待機動畫
+    if (!gIdleMode && millis() - gResultTime > IDLE_TIMEOUT_MS) {
+        gIdleMode = true;
+        gCatFrame = 0;
+        gLastCatFrame = millis();
+        drawIdleCat(0);
     }
+
+    // 待機動畫：每 600ms 換幀（僅 idle 模式）
+    if (gIdleMode && millis() - gLastCatFrame > 600) {
+        gLastCatFrame = millis();
+        gCatFrame = (gCatFrame + 1) % 10;
+        drawIdleCat(gCatFrame);
+    }
+
+    // 每 10 秒嘗試重連
+    static uint32_t lastReconnect = 0;
     if (WiFi.status() != WL_CONNECTED && millis() - lastReconnect > 10000) {
         lastReconnect = millis();
         Serial.println("WiFi lost, reconnecting...");
@@ -648,63 +736,74 @@ void loop() {
     if (digitalRead(0) == LOW) {
         delay(50);
         if (digitalRead(0) == LOW) {
-            uint32_t t0 = millis();
-            while (digitalRead(0) == LOW && millis() - t0 < 700) delay(10);
-
-            if (digitalRead(0) == LOW) {
-                // 長按（> 700ms）→ 語音輸入
-                askGeminiVoice();
-                while (digitalRead(0) == LOW) delay(10);
-            } else {
-                // 短按 → 抽運勢卡
-                drawFortuneCard();
-            }
+            while (digitalRead(0) == LOW) delay(10);
+            drawFortuneCard();
+            // 抽籤完畢：暫停動畫，記錄時間，1 分鐘後自動恢復
+            gIdleMode   = false;
+            gResultTime = millis();
         }
     }
 }
 
-// ── 運勢卡牌（由 Gemini 生成）────────────────────────────
+// ── 運勢卡牌（Buddy 貓咪大姐姐版）──────────────────────
 void drawFortuneCard() {
-    askGemini(
-        "請幫我抽一張今日運勢卡片。"
-        "格式如下，嚴格按照此格式輸出，不要多餘說明：\n"
-        "第一行：運勢等級（從「大吉/吉/中吉/小吉/末吉/凶/大凶」擇一）\n"
-        "第二行：一句話運勢描述（15字內）\n"
-        "第三行：今日建議（15字內）"
-    );
-}
+    // ASCII art 貓咪（來自 claude-desktop-buddy cat.cpp），依運勢等級選情緒
+    static const char* CAT_ARTS[7][5] = {
+        // 0 大吉 — celebrate JUMP  (eyes/body centered at col 5, 1 inner space)
+        { "  \\^   ^/  ", "   /\\_/\\   ", "  ( ^ ^ )  ", "  (  W  )  ", "  (\")_(\")" },
+        // 1 吉 — heart DREAMY
+        { "           ", "   /\\_/\\   ", "  ( ^ ^ )  ", "  (  u  )  ", "  (\")_(\")~" },
+        // 2 中吉 — idle REST
+        { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },
+        // 3 小吉 — idle BLINK
+        { "           ", "   /\\_/\\   ", "  ( - - )  ", "  (  w  )  ", "  (\")_(\")" },
+        // 4 末吉 — idle SLOW_BL
+        { "           ", "   /\\-/\\   ", "  ( _ _ )  ", "  (  w  )  ", "  (\")_(\")" },
+        // 5 凶 — dizzy WOOZY
+        { "           ", "   /\\_/\\   ", "  ( x @ )  ", "  (  v  )  ", "  (\")_(\")~" },
+        // 6 大凶 — dizzy SPLAT
+        { "           ", "   /\\_/\\   ", "  ( @ @ )  ", "  (  -  )  ", " (\")_(\")~" },
+    };
 
-void askGemini(String prompt) {
+    const char* levels[] = { "大吉", "吉", "中吉", "小吉", "末吉", "凶", "大凶" };
+    int idx = (int)(esp_random() % 7);
+    const char* level = levels[idx];
+
     quickMsg("Thinking...", 0x07FF);
+
+    char prompt[400];
+    snprintf(prompt, sizeof(prompt),
+        "你是一隻溫柔的貓咪大姐姐。"
+        "請用溫柔、關心、帶點可愛的語氣，幫我解讀今日「%s」的運勢。"
+        "一段話，40字內，繁體中文，句尾可以加「喵～」。",
+        level);
 
     WiFiClientSecure client;
     client.setInsecure();
     client.setTimeout(15);
-
     HTTPClient http;
-    String url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=" + String(apiKey);
+    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + String(model) + ":generateContent?key=" + String(apiKey);
     http.begin(client, url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(15000);
-    String payload = "{\"contents\":[{\"parts\":[{\"text\":\"" + prompt + " (請用繁體中文回答，100字內)\"}]}]}";
+    String payload = "{\"contents\":[{\"parts\":[{\"text\":\"" + String(prompt) + "\"}]}]}";
 
     int code = http.POST(payload);
-    Serial.printf("Gemini HTTP %d\n", code);
+    Serial.printf("Fortune HTTP %d\n", code);
 
     if (code == 200) {
         String resp = http.getString();
         DynamicJsonDocument doc(32768);
-        DeserializationError err = deserializeJson(doc, resp);
-        if (!err) {
+        if (!deserializeJson(doc, resp)) {
             const char* result = doc["candidates"][0]["content"]["parts"][0]["text"];
-            displayMessage(String(result), 0xFFFF);
+            displayBuddyMessage(CAT_ARTS[idx], String(result ? result : "喵～"));
         } else {
             displayMessage("解析錯誤", 0xF800);
         }
     } else {
-        String errBody = http.getString();
-        Serial.println(errBody);
-        displayMessage("API 錯誤\n錯誤碼: " + String(code), 0xF800);
+        Serial.println(http.getString());
+        displayMessage("API 錯誤\n" + String(code), 0xF800);
     }
     http.end();
 }
+

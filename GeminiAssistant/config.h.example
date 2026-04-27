@@ -2,8 +2,9 @@
 #define CONFIG_H
 
 // 請將此檔案更名為 config.h 並填入您的資訊
-const char* ssid = "YOUR_WIFI_SSID";
+const char* ssid     = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
-const char* apiKey = "YOUR_GEMINI_API_KEY";
+const char* apiKey   = "YOUR_GEMINI_API_KEY";
+const char* model    = "gemini-3-flash-preview";   // 可替換為其他 Gemini 模型
 
 #endif
