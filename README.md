@@ -34,6 +34,7 @@ cp GeminiAssistant/config.h.example GeminiAssistant/config.h
 const char* ssid     = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
 const char* apiKey   = "YOUR_GEMINI_API_KEY";
+const char* model    = "gemini-3-flash-preview";
 ```
 
 > API Key 申請：https://aistudio.google.com/apikey
