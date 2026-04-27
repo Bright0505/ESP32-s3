@@ -67,6 +67,18 @@ arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=
 
 自檢完成後進入貓咪待機動畫，按 BOOT 即可抽籤。
 
+## BLE 設定（feat/ble-provisioning 分支）
+
+WiFi 連線失敗時裝置自動進入 BLE 配對模式，使用手機 BLE UART app 傳送 JSON 填入設定：
+
+```json
+{"ssid":"MyWiFi","pass":"password","key":"AIzaSy...","model":"gemini-2.0-flash"}
+```
+
+設定儲存至 NVS，重啟後自動連線，無需重新燒錄。相容 **nRF Toolbox**（iOS/Android）、**Serial Bluetooth Terminal**（Android）等免費 app。
+
+> ⚠️ **安全提醒**：BLE 傳輸未加密，API Key 以明文傳送。請在私人環境下操作，避免在公共場所進行配對。
+
 ## AI 模型
 
 透過 [Google Gemini API](https://ai.google.dev/) 生成運勢內容，預設使用 `gemini-3-flash-preview`。

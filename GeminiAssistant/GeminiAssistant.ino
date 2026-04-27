@@ -658,23 +658,46 @@ void loadConfig() {
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+#define BLE_RX_BUF_MAX   1024  // 防止無限累積
 
-static BLECharacteristic* bleTx = nullptr;
-static String             bleRxBuf = "";
-static bool               bleConfigSaved = false;
+static BLECharacteristic*  bleTx = nullptr;
+static String              bleRxBuf = "";
+static volatile bool       bleConfigSaved = false; // volatile：RTOS task 與 main loop 共用
+
+// 斷線時清除殘留 buffer 並重新廣播，允許用戶再次連線
+class BLEServerCallback : public BLEServerCallbacks {
+    void onDisconnect(BLEServer*) override {
+        bleRxBuf = "";
+        BLEDevice::startAdvertising();
+        Serial.println("BLE client disconnected, re-advertising");
+    }
+};
 
 class BLERxCallback : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* c) override {
-        String val = c->getValue().c_str();
-        bleRxBuf += val;
-        // 收到完整 JSON（含 }）才解析
-        if (bleRxBuf.indexOf('}') < 0) return;
+        bleRxBuf += c->getValue().c_str();
 
-        DynamicJsonDocument doc(512);
-        if (deserializeJson(doc, bleRxBuf)) {
-            bleTx->setValue("ERR: invalid JSON\n");
-            bleTx->notify();
+        // 防止 buffer 無限增長（惡意或錯誤的 client）
+        if (bleRxBuf.length() > BLE_RX_BUF_MAX) {
             bleRxBuf = "";
+            if (bleTx) { bleTx->setValue("ERR: buffer overflow\n"); bleTx->notify(); }
+            return;
+        }
+
+        // 等待完整 JSON（以 } 結尾），避免密碼中含 } 的 edge case
+        // 以右括號配對計數確認 JSON 完整
+        int depth = 0;
+        bool complete = false;
+        for (int i = 0; i < (int)bleRxBuf.length(); i++) {
+            if (bleRxBuf[i] == '{') depth++;
+            else if (bleRxBuf[i] == '}') { depth--; if (depth == 0) { complete = true; break; } }
+        }
+        if (!complete) return;
+
+        DynamicJsonDocument doc(1024); // 足夠容納所有欄位
+        if (deserializeJson(doc, bleRxBuf)) {
+            bleRxBuf = "";
+            if (bleTx) { bleTx->setValue("ERR: invalid JSON\n"); bleTx->notify(); }
             return;
         }
         bleRxBuf = "";
@@ -687,20 +710,20 @@ class BLERxCallback : public BLECharacteristicCallbacks {
         if (doc.containsKey("model")) prefs.putString("model", doc["model"].as<const char*>());
         prefs.end();
 
-        bleTx->setValue("OK: saved, restarting...\n");
-        bleTx->notify();
+        if (bleTx) { bleTx->setValue("OK: saved, restarting...\n"); bleTx->notify(); }
         bleConfigSaved = true;
     }
 };
 
 void enterBLEProvisioning() {
-    // 裝置名稱：FortuneCat-XXXX（MAC 後 4 碼）
     uint64_t chipId = ESP.getEfuseMac();
     char devName[24];
     snprintf(devName, sizeof(devName), "FortuneCat-%04X", (uint16_t)(chipId >> 32));
 
     BLEDevice::init(devName);
-    BLEServer*  server  = BLEDevice::createServer();
+    BLEServer* server = BLEDevice::createServer();
+    server->setCallbacks(new BLEServerCallback()); // 斷線重廣播
+
     BLEService* service = server->createService(NUS_SERVICE_UUID);
 
     bleTx = service->createCharacteristic(NUS_TX_UUID,
@@ -719,11 +742,9 @@ void enterBLEProvisioning() {
 
     Serial.printf("BLE provisioning: %s\n", devName);
 
-    // 顯示在螢幕上（bitmap 字型，不需 TTF）
-    if (!msgCanvas) {
-        msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
-    }
-    if (msgCanvas->getBuffer()) {
+    // 螢幕顯示（bitmap 字型，不需 TTF）
+    if (!msgCanvas) msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
+    if (msgCanvas && msgCanvas->getBuffer()) {
         msgCanvas->fillScreen(0x0000);
         msgCanvas->setTextColor(0x07FF, 0x0000);
         msgCanvas->setTextSize(2);
@@ -731,18 +752,15 @@ void enterBLEProvisioning() {
         msgCanvas->print("BLE Setup Mode");
         msgCanvas->setTextColor(0xFFFF, 0x0000);
         msgCanvas->setTextSize(1);
-        msgCanvas->setCursor(50, 190);
-        msgCanvas->print("Connect to:");
-        msgCanvas->setCursor(50, 205);
-        msgCanvas->print(devName);
-        msgCanvas->setCursor(50, 230);
-        msgCanvas->print("Send JSON:");
-        msgCanvas->setCursor(30, 245);
-        msgCanvas->print("{\"ssid\":\"...\",");
-        msgCanvas->setCursor(30, 258);
-        msgCanvas->print(" \"pass\":\"...\",");
-        msgCanvas->setCursor(30, 271);
-        msgCanvas->print(" \"key\":\"...\"}");
+        msgCanvas->setCursor(50, 190);  msgCanvas->print("Connect to:");
+        msgCanvas->setCursor(50, 205);  msgCanvas->print(devName);
+        msgCanvas->setCursor(50, 230);  msgCanvas->print("Send JSON:");
+        msgCanvas->setCursor(30, 245);  msgCanvas->print("{\"ssid\":\"...\",");
+        msgCanvas->setCursor(30, 258);  msgCanvas->print(" \"pass\":\"...\",");
+        msgCanvas->setCursor(30, 271);  msgCanvas->print(" \"key\":\"...\"}");
+        msgCanvas->setTextColor(0x8410, 0x0000);
+        msgCanvas->setCursor(20, 300);  msgCanvas->print("Use BLE UART app");
+        msgCanvas->setCursor(20, 313);  msgCanvas->print("in private env only");
         blitCanvas();
     }
 
