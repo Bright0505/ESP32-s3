@@ -293,6 +293,29 @@ bool downloadFont() {
 // ── 待機貓咪動畫 ──────────────────────────────────────────
 // textSize=3 → 每字 18×24px；11字 × 18 = 198px wide；catX=(466-198)/2=134
 void drawIdleCat(int frame) {
+    // 無網路：全螢幕顯示離去訊息（bitmap 字型，不需 TTF）
+    if (WiFi.status() != WL_CONNECTED) {
+        if (!msgCanvas) {
+            msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
+            if (!msgCanvas->getBuffer()) { delete msgCanvas; msgCanvas = nullptr; return; }
+        }
+        msgCanvas->fillScreen(0x0000);
+        msgCanvas->setTextColor(0xF800, 0x0000);
+        msgCanvas->setTextWrap(true);
+        const char* line1 = "Without your care,";
+        const char* line2 = "I had to drift";
+        const char* line3 = "away sadly...";
+        msgCanvas->setTextSize(2);
+        msgCanvas->setCursor((DISPLAY_W - strlen(line1)*12)/2, 180);
+        msgCanvas->print(line1);
+        msgCanvas->setCursor((DISPLAY_W - strlen(line2)*12)/2, 210);
+        msgCanvas->print(line2);
+        msgCanvas->setCursor((DISPLAY_W - strlen(line3)*12)/2, 240);
+        msgCanvas->print(line3);
+        blitCanvas();
+        return;
+    }
+
     // 10 幀循環：REST / BLINK / REST / EAR_L / REST / EAR_R / REST / GROOM / REST / TAIL
     static const char* FRAMES[10][5] = {
         { "           ", "   /\\_/\\   ", "  ( o o )  ", "  (  w  )  ", "  (\")_(\")" },  // 0 REST
@@ -570,15 +593,7 @@ static void renderWifiToCanvas() {
     bool connected  = (status == WL_CONNECTED);
     bool connecting = (status == WL_DISCONNECTED || status == WL_IDLE_STATUS);
 
-    if (!connected && !connecting) {
-        msgCanvas->drawChar(X0 + 2*SP, Y, 0x02, 0xF800, 0x0000, TS);
-        const char* msg = "Sadly drifted away...";
-        msgCanvas->setTextSize(1);
-        msgCanvas->setTextColor(0xF800, 0x0000);
-        msgCanvas->setCursor((DISPLAY_W - (int)strlen(msg)*6) / 2, Y + CH + 2);
-        msgCanvas->print(msg);
-        return;
-    }
+    if (!connected && !connecting) return; // 無訊號由 drawIdleCat 負責全螢幕訊息
 
     int count = 0;
     uint16_t faceColor;
