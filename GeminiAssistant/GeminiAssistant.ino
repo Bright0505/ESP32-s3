@@ -8,10 +8,21 @@
 #include <Wire.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include "OpenFontRender.h"
 #include "ofrfs/M5Stack_SD_Preset.h"
 #include "XPowersLib.h"
 #include "config.h"
+
+// Runtime config — NVS → DEFAULT_* fallback
+char cfgSsid[64];
+char cfgPass[64];
+char cfgApiKey[128];
+char cfgModel[64];
 
 /* Display (QSPI) */
 #define LCD_SDIO0  4
@@ -627,6 +638,119 @@ void drawWifiIcon() {
     gfx->fillCircle(448, 20, 5, ok ? 0x07E0 : 0xF800);
 }
 
+// ── 設定載入（NVS → config.h fallback）─────────────────
+void loadConfig() {
+    Preferences prefs;
+    prefs.begin("cfg", true); // read-only
+    String s = prefs.getString("ssid", DEFAULT_SSID);
+    String p = prefs.getString("pass", DEFAULT_PASSWORD);
+    String k = prefs.getString("key",  DEFAULT_API_KEY);
+    String m = prefs.getString("model", DEFAULT_MODEL);
+    prefs.end();
+    s.toCharArray(cfgSsid,   sizeof(cfgSsid));
+    p.toCharArray(cfgPass,   sizeof(cfgPass));
+    k.toCharArray(cfgApiKey, sizeof(cfgApiKey));
+    m.toCharArray(cfgModel,  sizeof(cfgModel));
+    Serial.printf("Config: SSID=%s  model=%s\n", cfgSsid, cfgModel);
+}
+
+// ── BLE Provisioning（Nordic UART Service）──────────────
+#define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+static BLECharacteristic* bleTx = nullptr;
+static String             bleRxBuf = "";
+static bool               bleConfigSaved = false;
+
+class BLERxCallback : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* c) override {
+        String val = c->getValue().c_str();
+        bleRxBuf += val;
+        // 收到完整 JSON（含 }）才解析
+        if (bleRxBuf.indexOf('}') < 0) return;
+
+        DynamicJsonDocument doc(512);
+        if (deserializeJson(doc, bleRxBuf)) {
+            bleTx->setValue("ERR: invalid JSON\n");
+            bleTx->notify();
+            bleRxBuf = "";
+            return;
+        }
+        bleRxBuf = "";
+
+        Preferences prefs;
+        prefs.begin("cfg", false);
+        if (doc.containsKey("ssid"))  prefs.putString("ssid",  doc["ssid"].as<const char*>());
+        if (doc.containsKey("pass"))  prefs.putString("pass",  doc["pass"].as<const char*>());
+        if (doc.containsKey("key"))   prefs.putString("key",   doc["key"].as<const char*>());
+        if (doc.containsKey("model")) prefs.putString("model", doc["model"].as<const char*>());
+        prefs.end();
+
+        bleTx->setValue("OK: saved, restarting...\n");
+        bleTx->notify();
+        bleConfigSaved = true;
+    }
+};
+
+void enterBLEProvisioning() {
+    // 裝置名稱：FortuneCat-XXXX（MAC 後 4 碼）
+    uint64_t chipId = ESP.getEfuseMac();
+    char devName[24];
+    snprintf(devName, sizeof(devName), "FortuneCat-%04X", (uint16_t)(chipId >> 32));
+
+    BLEDevice::init(devName);
+    BLEServer*  server  = BLEDevice::createServer();
+    BLEService* service = server->createService(NUS_SERVICE_UUID);
+
+    bleTx = service->createCharacteristic(NUS_TX_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY);
+    bleTx->addDescriptor(new BLE2902());
+
+    BLECharacteristic* rx = service->createCharacteristic(NUS_RX_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    rx->setCallbacks(new BLERxCallback());
+
+    service->start();
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(NUS_SERVICE_UUID);
+    adv->setScanResponse(true);
+    BLEDevice::startAdvertising();
+
+    Serial.printf("BLE provisioning: %s\n", devName);
+
+    // 顯示在螢幕上（bitmap 字型，不需 TTF）
+    if (!msgCanvas) {
+        msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
+    }
+    if (msgCanvas->getBuffer()) {
+        msgCanvas->fillScreen(0x0000);
+        msgCanvas->setTextColor(0x07FF, 0x0000);
+        msgCanvas->setTextSize(2);
+        msgCanvas->setCursor(60, 150);
+        msgCanvas->print("BLE Setup Mode");
+        msgCanvas->setTextColor(0xFFFF, 0x0000);
+        msgCanvas->setTextSize(1);
+        msgCanvas->setCursor(50, 190);
+        msgCanvas->print("Connect to:");
+        msgCanvas->setCursor(50, 205);
+        msgCanvas->print(devName);
+        msgCanvas->setCursor(50, 230);
+        msgCanvas->print("Send JSON:");
+        msgCanvas->setCursor(30, 245);
+        msgCanvas->print("{\"ssid\":\"...\",");
+        msgCanvas->setCursor(30, 258);
+        msgCanvas->print(" \"pass\":\"...\",");
+        msgCanvas->setCursor(30, 271);
+        msgCanvas->print(" \"key\":\"...\"}");
+        blitCanvas();
+    }
+
+    while (!bleConfigSaved) delay(100);
+    delay(1000);
+    ESP.restart();
+}
+
 // ── Setup ───────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -661,13 +785,15 @@ void setup() {
         while (true) delay(1000);  // 無法繼續，停在這裡
     }
 
+    loadConfig(); // NVS → config.h fallback
+
     // ── Step 2: WiFi ──
     setRowStatus(ROW_WIFI, BS_CHECKING);
-    WiFi.begin(ssid, password);
+    WiFi.begin(cfgSsid, cfgPass);
     int tries = 0;
     while (WiFi.status() != WL_CONNECTED && tries++ < 60) {  // 30秒
         delay(500);
-        if (tries % 10 == 0) {  // 每5秒顯示進度
+        if (tries % 10 == 0) {
             char prog[20]; snprintf(prog, sizeof(prog), "Trying %d/30s", tries/2);
             setRowStatus(ROW_WIFI, BS_CHECKING, prog);
         }
@@ -677,9 +803,10 @@ void setup() {
         setRowStatus(ROW_WIFI, BS_OK, WiFi.localIP().toString().c_str());
         Serial.printf("WiFi OK  %s\n", WiFi.localIP().toString().c_str());
     } else {
-        setRowStatus(ROW_WIFI, BS_FAIL, "Check SSID/Password");
-        Serial.println("WiFi FAIL");
-        // WiFi 失敗但 SD 有字型仍可嘗試載入
+        setRowStatus(ROW_WIFI, BS_FAIL, "BLE Setup starting...");
+        Serial.println("WiFi FAIL → entering BLE provisioning");
+        delay(1000);
+        enterBLEProvisioning(); // 不會返回，重啟後重新走 setup
     }
 
     // ── Step 3: Font ──
@@ -782,7 +909,7 @@ void loop() {
         Serial.println("WiFi lost, reconnecting...");
         WiFi.disconnect();
         delay(100);
-        WiFi.begin(ssid, password);
+        WiFi.begin(cfgSsid, cfgPass);
     }
 
     if (digitalRead(0) == LOW) {
@@ -834,7 +961,7 @@ void drawFortuneCard() {
     client.setInsecure();
     client.setTimeout(15);
     HTTPClient http;
-    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + String(model) + ":generateContent?key=" + String(apiKey);
+    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + String(cfgModel) + ":generateContent?key=" + String(cfgApiKey);
     http.begin(client, url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(15000);
