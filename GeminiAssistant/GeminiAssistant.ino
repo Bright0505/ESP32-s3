@@ -333,8 +333,8 @@ void drawIdleCat(int frame) {
     msgCanvas->setCursor(hx, 310);
     msgCanvas->print(hint);
 
+    renderWifiToCanvas();
     blitCanvas();
-    drawWifiIcon();
 }
 
 // 快速狀態文字（內建字型，無 OFR，瞬間顯示）
@@ -437,8 +437,8 @@ void displayMessage(String text, uint16_t color) {
         y += lineH;
     }
 
+    renderWifiToCanvas();
     blitCanvas();
-    drawWifiIcon();
 }
 
 // ── Buddy 對話框顯示 ─────────────────────────────────────
@@ -513,8 +513,8 @@ void displayBuddyMessage(const char* cat[5], String text) {
         rendered++;
     }
 
+    renderWifiToCanvas();
     blitCanvas();
-    drawWifiIcon();
 }
 
 void blitCanvas() {
@@ -553,26 +553,63 @@ void blitCanvas() {
     heap_caps_free(dst);
 }
 
-// ── WiFi 狀態圖示（小圓點：紅/黃/綠）───────────────────
-void drawWifiIcon() {
-    const int CX = 448, CY = 20, R = 7;
+// ── WiFi 狀態圖示（畫進 canvas 避免閃爍，textSize=4 放大版）──
+// 5 字 24×32px，水平置中；在 blitCanvas 前呼叫
+static void renderWifiToCanvas() {
+    if (!msgCanvas) return;
+
+    const int TS = 4;
+    const int CW = 6 * TS;   // 24px
+    const int CH = 8 * TS;   // 32px
+    const int SP = CW + 4;   // 28px 間距
+    const int N  = 5;
+    const int Y  = 38;
+    const int X0 = (DISPLAY_W - ((N-1)*SP + CW)) / 2; // 165
 
     wl_status_t status = WiFi.status();
     bool connected  = (status == WL_CONNECTED);
     bool connecting = (status == WL_DISCONNECTED || status == WL_IDLE_STATUS);
 
-    uint16_t color;
-    if (connecting) {
-        color = (millis() / 400 % 2) ? 0xFFE0 : 0x0000; // 黃色閃爍
-    } else if (!connected) {
-        color = 0xF800; // 紅：斷線
-    } else {
-        int32_t rssi = WiFi.RSSI();
-        color = (rssi >= -65) ? 0x07E0 : 0xFFE0; // 綠：強訊號  黃：弱訊號
+    if (!connected && !connecting) {
+        msgCanvas->drawChar(X0 + 2*SP, Y, 0x02, 0xF800, 0x0000, TS);
+        const char* msg = "Sadly drifted away...";
+        msgCanvas->setTextSize(1);
+        msgCanvas->setTextColor(0xF800, 0x0000);
+        msgCanvas->setCursor((DISPLAY_W - (int)strlen(msg)*6) / 2, Y + CH + 2);
+        msgCanvas->print(msg);
+        return;
     }
 
-    gfx->fillCircle(CX, CY, R, 0x0000);   // 清除
-    gfx->fillCircle(CX, CY, R, color);
+    int count = 0;
+    uint16_t faceColor;
+    if (connecting) {
+        if (!(millis() / 500 % 2)) return;
+        count = 1;
+        faceColor = 0xFFE0;
+    } else {
+        int32_t rssi = WiFi.RSSI();
+        if      (rssi >= -55) count = 5;
+        else if (rssi >= -65) count = 4;
+        else if (rssi >= -75) count = 3;
+        else if (rssi >= -85) count = 2;
+        else                  count = 1;
+        faceColor = (count >= 4) ? 0x07E0 : (count >= 2 ? 0xFFE0 : 0xFD20);
+    }
+
+    for (int i = 0; i < N; i++) {
+        int x = X0 + i * SP;
+        if (i < count)
+            msgCanvas->drawChar(x, Y, 0x02, faceColor, 0x0000, TS); // ☻
+        else
+            msgCanvas->drawChar(x, Y, 0x01, 0xC618,    0x0000, TS); // ☺ 灰
+    }
+}
+
+// 給 quickMsg 等不用 canvas 的場合：簡易圓點
+void drawWifiIcon() {
+    bool ok = (WiFi.status() == WL_CONNECTED);
+    gfx->fillCircle(448, 20, 5, 0x0000);
+    gfx->fillCircle(448, 20, 5, ok ? 0x07E0 : 0xF800);
 }
 
 // ── Setup ───────────────────────────────────────────────
