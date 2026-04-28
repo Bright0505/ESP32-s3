@@ -17,12 +17,14 @@
 #include "ofrfs/M5Stack_SD_Preset.h"
 #include "XPowersLib.h"
 #include "config.h"
+#include "nerd_mining.h"
 
 // Runtime config — NVS → DEFAULT_* fallback
 char cfgSsid[64];
 char cfgPass[64];
 char cfgApiKey[128];
 char cfgModel[64];
+// cfgBtcAddr / cfgPool / cfgPoolPort declared in nerd_mining.h / nerd_mining.cpp
 
 /* Display (QSPI) */
 #define LCD_SDIO0  4
@@ -301,6 +303,57 @@ bool downloadFont() {
     return true;
 }
 
+// ── 挖礦統計畫面（bitmap 字型，不需 TTF）────────────────
+void drawMiningScreen() {
+    if (!msgCanvas) {
+        msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
+        if (!msgCanvas->getBuffer()) { delete msgCanvas; msgCanvas = nullptr; return; }
+    }
+    msgCanvas->fillScreen(0x0000);
+
+    // Title
+    msgCanvas->setTextColor(0xFD20, 0x0000);  // 橘黃
+    msgCanvas->setTextSize(2);
+    msgCanvas->setCursor(cx("  Bitcoin Mining  ", 2), 50);
+    msgCanvas->print("  Bitcoin Mining  ");
+
+    // Stats
+    msgCanvas->setTextColor(0xFFFF, 0x0000);
+    msgCanvas->setTextSize(2);
+
+    char buf[40];
+    uint32_t khs = mineKHs;
+    if (khs >= 1000) snprintf(buf, sizeof(buf), "Hash: %lu.%01lu MH/s", khs/1000, (khs%1000)/100);
+    else             snprintf(buf, sizeof(buf), "Hash: %lu kH/s", khs);
+    msgCanvas->setCursor(30, 110); msgCanvas->print(buf);
+
+    snprintf(buf, sizeof(buf), "Shares:%lu  Valid:%lu", (unsigned long)mineShares, (unsigned long)mineValids);
+    msgCanvas->setCursor(30, 140); msgCanvas->print(buf);
+
+    uint64_t up = mineUptime;
+    snprintf(buf, sizeof(buf), "Up: %02llu:%02llu:%02llu", up/3600, (up%3600)/60, up%60);
+    msgCanvas->setCursor(30, 170); msgCanvas->print(buf);
+
+    double bd = mineBestDiff;
+    if (bd >= 1e6)     snprintf(buf, sizeof(buf), "Best: %.2fM", bd/1e6);
+    else if (bd >= 1e3) snprintf(buf, sizeof(buf), "Best: %.2fK", bd/1e3);
+    else                snprintf(buf, sizeof(buf), "Best: %.2f",  bd);
+    msgCanvas->setCursor(30, 200); msgCanvas->print(buf);
+
+    // Pool info
+    msgCanvas->setTextColor(0x8410, 0x0000);
+    msgCanvas->setTextSize(1);
+    msgCanvas->setCursor(30, 240); msgCanvas->print(cfgPool);
+
+    // Status indicator
+    msgCanvas->setTextColor(mineActive ? 0x07E0 : 0xF800, 0x0000);
+    msgCanvas->setCursor(30, 255);
+    msgCanvas->print(mineActive ? "Connected" : "Connecting...");
+
+    renderWifiToCanvas();
+    blitCanvas();
+}
+
 // ── 待機貓咪動畫 ──────────────────────────────────────────
 // textSize=3 → 每字 18×24px；11字 × 18 = 198px wide；catX=(466-198)/2=134
 void drawIdleCat(int frame) {
@@ -324,6 +377,12 @@ void drawIdleCat(int frame) {
         msgCanvas->setCursor((DISPLAY_W - strlen(line3)*12)/2, 240);
         msgCanvas->print(line3);
         blitCanvas();
+        return;
+    }
+
+    // 有 WiFi：顯示挖礦統計（每 10 幀換一次，其餘幀顯示貓咪）
+    if (frame % 10 == 0 && WiFi.status() == WL_CONNECTED) {
+        drawMiningScreen();
         return;
     }
 
@@ -641,17 +700,23 @@ void drawWifiIcon() {
 // ── 設定載入（NVS → config.h fallback）─────────────────
 void loadConfig() {
     Preferences prefs;
-    prefs.begin("cfg", true); // read-only
-    String s = prefs.getString("ssid", DEFAULT_SSID);
-    String p = prefs.getString("pass", DEFAULT_PASSWORD);
-    String k = prefs.getString("key",  DEFAULT_API_KEY);
-    String m = prefs.getString("model", DEFAULT_MODEL);
+    prefs.begin("cfg", true);
+    String s  = prefs.getString("ssid",      DEFAULT_SSID);
+    String p  = prefs.getString("pass",      DEFAULT_PASSWORD);
+    String k  = prefs.getString("key",       DEFAULT_API_KEY);
+    String m  = prefs.getString("model",     DEFAULT_MODEL);
+    String ba = prefs.getString("btc_addr",  DEFAULT_BTC_ADDR);
+    String pl = prefs.getString("pool",      DEFAULT_POOL);
+    String pp = prefs.getString("pool_port", DEFAULT_POOL_PORT);
     prefs.end();
     s.toCharArray(cfgSsid,   sizeof(cfgSsid));
     p.toCharArray(cfgPass,   sizeof(cfgPass));
     k.toCharArray(cfgApiKey, sizeof(cfgApiKey));
     m.toCharArray(cfgModel,  sizeof(cfgModel));
-    Serial.printf("Config: SSID=%s  model=%s\n", cfgSsid, cfgModel);
+    ba.toCharArray(cfgBtcAddr,  sizeof(cfgBtcAddr));
+    pl.toCharArray(cfgPool,     sizeof(cfgPool));
+    pp.toCharArray(cfgPoolPort, sizeof(cfgPoolPort));
+    Serial.printf("Config: SSID=%s  pool=%s:%s\n", cfgSsid, cfgPool, cfgPoolPort);
 }
 
 // ── BLE Provisioning（Nordic UART Service）──────────────
@@ -704,10 +769,13 @@ class BLERxCallback : public BLECharacteristicCallbacks {
 
         Preferences prefs;
         prefs.begin("cfg", false);
-        if (doc.containsKey("ssid"))  prefs.putString("ssid",  doc["ssid"].as<const char*>());
-        if (doc.containsKey("pass"))  prefs.putString("pass",  doc["pass"].as<const char*>());
-        if (doc.containsKey("key"))   prefs.putString("key",   doc["key"].as<const char*>());
-        if (doc.containsKey("model")) prefs.putString("model", doc["model"].as<const char*>());
+        if (doc.containsKey("ssid"))      prefs.putString("ssid",      doc["ssid"].as<const char*>());
+        if (doc.containsKey("pass"))      prefs.putString("pass",      doc["pass"].as<const char*>());
+        if (doc.containsKey("key"))       prefs.putString("key",       doc["key"].as<const char*>());
+        if (doc.containsKey("model"))     prefs.putString("model",     doc["model"].as<const char*>());
+        if (doc.containsKey("btc_addr"))  prefs.putString("btc_addr",  doc["btc_addr"].as<const char*>());
+        if (doc.containsKey("pool"))      prefs.putString("pool",      doc["pool"].as<const char*>());
+        if (doc.containsKey("pool_port")) prefs.putString("pool_port", doc["pool_port"].as<const char*>());
         prefs.end();
 
         if (bleTx) { bleTx->setValue("OK: saved, restarting...\n"); bleTx->notify(); }
@@ -820,6 +888,8 @@ void setup() {
     if (wifiOk) {
         setRowStatus(ROW_WIFI, BS_OK, WiFi.localIP().toString().c_str());
         Serial.printf("WiFi OK  %s\n", WiFi.localIP().toString().c_str());
+        // 啟動挖礦 Stratum worker 在 Core 0
+        xTaskCreatePinnedToCore(runStratumWorker, "stratum", 8192, (void*)"stratum", 3, nullptr, 0);
     } else {
         setRowStatus(ROW_WIFI, BS_FAIL, "BLE Setup starting...");
         Serial.println("WiFi FAIL → entering BLE provisioning");
