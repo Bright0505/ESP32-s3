@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 FQBN 必須包含 `CDCOnBoot=cdc`，否則 `Serial.printf` 不會透過 USB 輸出。
 
 ```bash
-# 編譯
-arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi --output-dir build GeminiAssistant/
+# 編譯（PartitionScheme=huge_app：3MB app，適用裝置 4MB flash）
+arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=huge_app --output-dir build GeminiAssistant/
 
 # 燒錄
-arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi --port /dev/cu.usbmodem1101 --input-dir build GeminiAssistant/
+arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=huge_app --port /dev/cu.usbmodem1101 --input-dir build GeminiAssistant/
 ```
 
 ## Serial Monitor
