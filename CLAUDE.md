@@ -6,12 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 FQBN 必須包含 `CDCOnBoot=cdc`，否則 `Serial.printf` 不會透過 USB 輸出。
 
+加入 NerdMiner 後 sketch 超過 1.25MB 預設分區，**必須加 `PartitionScheme=huge_app`**（3MB app，無 OTA）。
+
 ```bash
 # 編譯
-arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi --output-dir build GeminiAssistant/
+arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=huge_app --output-dir build GeminiAssistant/
 
 # 燒錄
-arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi --port /dev/cu.usbmodem1101 --input-dir build GeminiAssistant/
+arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=huge_app --port /dev/cu.usbmodem1101 --input-dir build GeminiAssistant/
 ```
 
 ## Serial Monitor
@@ -39,7 +41,7 @@ python3 monitor.py   # 同時輸出至 log.txt，執行 600 秒
 ### 開機流程（setup）
 1. Serial → Wire/AXP2101 電源初始化 → display 初始化
 2. SD 卡掛載（失敗則停機）
-3. WiFi 連線
+3. WiFi 連線；連線成功後在 Core 0 啟動 `runStratumWorker`（Bitcoin 挖礦）
 4. 字型下載/驗證（存 SD `/font.ttf`，PSRAM 載入）
 5. 顯示 `drawIdleCat(0)` — 貓咪動畫開始
 
@@ -51,12 +53,29 @@ python3 monitor.py   # 同時輸出至 log.txt，執行 600 秒
 ### 主要函式
 | 函式 | 說明 |
 |---|---|
-| `drawIdleCat(frame)` | 待機動畫，10 幀循環（REST/BLINK/EAR_L/EAR_R/GROOM/TAIL），每幀 600ms |
+| `drawIdleCat(frame)` | 待機動畫，10 幀循環（REST/BLINK/EAR_L/EAR_R/GROOM/TAIL），每幀 600ms；貓咪下方每幀同時顯示挖礦統計 |
 | `drawFortuneCard()` | 亂數決定運勢等級，選對應 ASCII 貓咪，送溫柔大姐姐 prompt 給 Gemini |
 | `displayBuddyMessage(cat, text)` | 上方渲染 ASCII 貓咪 + 下方對話框顯示文字 |
 | `displayMessage(text, color)` | TTF 渲染文字至 canvas，支援自動換行與避頭禁則 |
 | `wrapSegment(seg, out, maxW)` | UTF-8 aware 斷行，含避頭禁則；maxW 預設 `DISPLAY_W-10` |
 | `drawWifiIcon()` | 右上角小圓點（綠/黃/紅）顯示 WiFi 狀態 |
+
+### NerdMiner 比特幣挖礦（nerd_mining / nerd_stratum）
+
+`runStratumWorker`（Core 0，priority 3）：連接 Stratum pool → 派發 job → 啟動 `minerWorkerHw` task 做 SHA256 硬體運算。
+
+全域統計變數（Core 0 寫，Core 1 UI 讀）：
+
+| 變數 | 說明 |
+|---|---|
+| `mineKHs` | 當前 hash rate（kH/s） |
+| `mineShares` | 提交 share 數 |
+| `mineValids` | 有效區塊數 |
+| `mineUptime` | 挖礦秒數 |
+| `mineBestDiff` | 見過的最佳 difficulty |
+| `mineActive` | Stratum 連線狀態 |
+
+Pool 設定（`cfgPool`、`cfgPoolPort`、`cfgBtcAddr`）來自 `config.h` 或 BLE provisioning 存入 NVS。
 
 ### 顯示系統
 
@@ -111,3 +130,4 @@ y=175~330  對話框（圓角矩形，白框，最多 3 行中文，垂直置中
 - `ArduinoJson` 7.x API（`DynamicJsonDocument` 仍支援但為相容層）
 - 圓形螢幕邊角會裁切：x=18 的 UI 元素在 y<143 或 y>323 時會被遮住
 - 不要在待機畫面使用特定 AI 模型名稱（未來可能換模型）
+- Sketch 約 1.5MB，超出預設 1.25MB 分區，必須用 `PartitionScheme=huge_app`（無 OTA）

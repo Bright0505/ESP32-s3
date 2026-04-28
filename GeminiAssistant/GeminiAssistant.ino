@@ -303,59 +303,9 @@ bool downloadFont() {
     return true;
 }
 
-// ── 挖礦統計畫面（bitmap 字型，不需 TTF）────────────────
-void drawMiningScreen() {
-    if (!msgCanvas) {
-        msgCanvas = new GFXcanvas16(DISPLAY_W, DISPLAY_H);
-        if (!msgCanvas->getBuffer()) { delete msgCanvas; msgCanvas = nullptr; return; }
-    }
-    msgCanvas->fillScreen(0x0000);
-
-    // Title
-    msgCanvas->setTextColor(0xFD20, 0x0000);  // 橘黃
-    msgCanvas->setTextSize(2);
-    msgCanvas->setCursor(cx("  Bitcoin Mining  ", 2), 50);
-    msgCanvas->print("  Bitcoin Mining  ");
-
-    // Stats
-    msgCanvas->setTextColor(0xFFFF, 0x0000);
-    msgCanvas->setTextSize(2);
-
-    char buf[40];
-    uint32_t khs = mineKHs;
-    if (khs >= 1000) snprintf(buf, sizeof(buf), "Hash: %lu.%01lu MH/s", khs/1000, (khs%1000)/100);
-    else             snprintf(buf, sizeof(buf), "Hash: %lu kH/s", khs);
-    msgCanvas->setCursor(30, 110); msgCanvas->print(buf);
-
-    snprintf(buf, sizeof(buf), "Shares:%lu  Valid:%lu", (unsigned long)mineShares, (unsigned long)mineValids);
-    msgCanvas->setCursor(30, 140); msgCanvas->print(buf);
-
-    uint64_t up = mineUptime;
-    snprintf(buf, sizeof(buf), "Up: %02llu:%02llu:%02llu", up/3600, (up%3600)/60, up%60);
-    msgCanvas->setCursor(30, 170); msgCanvas->print(buf);
-
-    double bd = mineBestDiff;
-    if (bd >= 1e6)     snprintf(buf, sizeof(buf), "Best: %.2fM", bd/1e6);
-    else if (bd >= 1e3) snprintf(buf, sizeof(buf), "Best: %.2fK", bd/1e3);
-    else                snprintf(buf, sizeof(buf), "Best: %.2f",  bd);
-    msgCanvas->setCursor(30, 200); msgCanvas->print(buf);
-
-    // Pool info
-    msgCanvas->setTextColor(0x8410, 0x0000);
-    msgCanvas->setTextSize(1);
-    msgCanvas->setCursor(30, 240); msgCanvas->print(cfgPool);
-
-    // Status indicator
-    msgCanvas->setTextColor(mineActive ? 0x07E0 : 0xF800, 0x0000);
-    msgCanvas->setCursor(30, 255);
-    msgCanvas->print(mineActive ? "Connected" : "Connecting...");
-
-    renderWifiToCanvas();
-    blitCanvas();
-}
-
 // ── 待機貓咪動畫 ──────────────────────────────────────────
 // textSize=3 → 每字 18×24px；11字 × 18 = 198px wide；catX=(466-198)/2=134
+// catY=62：貓咪佔 y=62~182，下方 y=200~310 顯示挖礦統計
 void drawIdleCat(int frame) {
     // 無網路：全螢幕顯示離去訊息（bitmap 字型，不需 TTF）
     if (WiFi.status() != WL_CONNECTED) {
@@ -377,12 +327,6 @@ void drawIdleCat(int frame) {
         msgCanvas->setCursor((DISPLAY_W - strlen(line3)*12)/2, 240);
         msgCanvas->print(line3);
         blitCanvas();
-        return;
-    }
-
-    // 有 WiFi：顯示挖礦統計（每 10 幀換一次，其餘幀顯示貓咪）
-    if (frame % 10 == 0 && WiFi.status() == WL_CONNECTED) {
-        drawMiningScreen();
         return;
     }
 
@@ -408,7 +352,7 @@ void drawIdleCat(int frame) {
 
     const int CAT_CHAR_W = 18, CAT_CHAR_H = 24, CAT_COLS = 11, CAT_ROWS = 5;
     int catX = (DISPLAY_W - CAT_CHAR_W * CAT_COLS) / 2; // 134
-    int catY = 155;
+    int catY = 62;
 
     msgCanvas->setTextSize(3);
     msgCanvas->setTextColor(0xFD20); // 橘黃
@@ -418,13 +362,37 @@ void drawIdleCat(int frame) {
         msgCanvas->print(FRAMES[frame][i]);
     }
 
-    // 底部提示（textSize=2，白色，置中）
-    const char* hint = "Press BOOT to draw";
-    int hx = (DISPLAY_W - (int)strlen(hint) * 12) / 2;
+    // 挖礦統計（貓咪下方，y=200~335，靠左對齊貓咪左邊界 x=catX）
+    char buf[40];
+    msgCanvas->setTextWrap(false);
+    msgCanvas->setTextSize(3);
+    msgCanvas->setTextColor(0xFFFF);
+
+    uint32_t khs = mineKHs;
+    if (khs >= 1000) snprintf(buf, sizeof(buf), "Hash: %lu.%01lu MH/s", khs/1000, (khs%1000)/100);
+    else             snprintf(buf, sizeof(buf), "Hash: %lu kH/s", khs);
+    msgCanvas->setCursor(catX, 200); msgCanvas->print(buf);
+
+    snprintf(buf, sizeof(buf), "S:%lu  V:%lu", (unsigned long)mineShares, (unsigned long)mineValids);
+    msgCanvas->setCursor(catX, 228); msgCanvas->print(buf);
+
+    uint64_t up = mineUptime;
+    snprintf(buf, sizeof(buf), "Up: %02llu:%02llu:%02llu", up/3600, (up%3600)/60, up%60);
+    msgCanvas->setCursor(catX, 256); msgCanvas->print(buf);
+
+    double bd = mineBestDiff;
+    if (bd >= 1e6)      snprintf(buf, sizeof(buf), "Best: %.2fM", bd/1e6);
+    else if (bd >= 1e3) snprintf(buf, sizeof(buf), "Best: %.2fK", bd/1e3);
+    else                snprintf(buf, sizeof(buf), "Best: %.2f",  bd);
+    msgCanvas->setCursor(catX, 284); msgCanvas->print(buf);
+
     msgCanvas->setTextSize(2);
-    msgCanvas->setTextColor(0x8410); // 暗灰
-    msgCanvas->setCursor(hx, 310);
-    msgCanvas->print(hint);
+    msgCanvas->setTextColor(0x8410);
+    msgCanvas->setCursor(catX, 315); msgCanvas->print(cfgPool);
+
+    msgCanvas->setTextColor(mineActive ? 0x07E0 : 0xF800);
+    const char* status = mineActive ? "Connected" : "Connecting...";
+    msgCanvas->setCursor(catX, 335); msgCanvas->print(status);
 
     renderWifiToCanvas();
     blitCanvas();
