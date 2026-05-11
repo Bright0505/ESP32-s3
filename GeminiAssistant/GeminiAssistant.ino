@@ -13,6 +13,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "esp_mac.h"
 #include "OpenFontRender.h"
 #include "ofrfs/M5Stack_SD_Preset.h"
 #include "XPowersLib.h"
@@ -62,6 +63,28 @@ OpenFontRender render;
 SPIClass sdSPI(HSPI);
 bool fontLoaded = false;
 GFXcanvas16 *msgCanvas = nullptr;
+
+// Gemini API Persistent Connection
+WiFiClientSecure client;
+HTTPClient http;
+bool httpConnected = false;
+
+void connectToGemini() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (httpConnected && http.connected()) return;
+
+    Serial.println("[HTTP] Establishing persistent connection to Gemini...");
+    client.setInsecure();
+    client.setTimeout(10);
+    
+    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + String(cfgModel) + ":generateContent?key=" + String(cfgApiKey);
+    
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Connection", "keep-alive");
+    http.setTimeout(15000);
+    httpConnected = true;
+}
 
 // 待機貓咪動畫
 static int      gCatFrame     = 0;
@@ -827,7 +850,7 @@ void setup() {
     setRowStatus(ROW_SD, BS_CHECKING);
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI);
     delay(200);
-    bool sdOk = SD.begin(SD_CS, sdSPI, 4000000);
+    bool sdOk = SD.begin(SD_CS, sdSPI, 20000000); // 提升至 20MHz
     if (sdOk) {
         char info[32];
         snprintf(info, sizeof(info), "%lluMB", SD.cardSize() / (1024*1024));
@@ -909,12 +932,34 @@ void setup() {
     setProgress(finfo);
     delay(500);
 
-    render.setDrawer(*gfx);
     Serial.printf("Free internal heap: %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     Serial.printf("Free PSRAM:         %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    Serial.printf("Loading font from SD (%luKB)...\n", fsize / 1024);
-    Serial.flush();
-    int fontErr = render.loadFont(FONT_PATH);
+    
+    uint8_t* fontBuffer = nullptr;
+    if (psramFound()) {
+        setProgress("Loading font to PSRAM...");
+        fontBuffer = (uint8_t*)ps_malloc(fsize);
+        if (fontBuffer) {
+            File fi = SD.open(FONT_PATH, FILE_READ);
+            if (fi) {
+                fi.read(fontBuffer, fsize);
+                fi.close();
+                Serial.printf("Font loaded to PSRAM: %lu bytes\n", fsize);
+            } else {
+                free(fontBuffer);
+                fontBuffer = nullptr;
+            }
+        }
+    }
+
+    render.setDrawer(*gfx);
+    int fontErr = -1;
+    if (fontBuffer) {
+        fontErr = render.loadFont(fontBuffer, fsize);
+    } else {
+        Serial.printf("Loading font from SD (%luKB)...\n", fsize / 1024);
+        fontErr = render.loadFont(FONT_PATH);
+    }
     Serial.printf("render.loadFont returned: %d\n", fontErr);
     Serial.flush();
     if (fontErr != 0) {
@@ -956,6 +1001,13 @@ void loop() {
         gLastCatFrame = millis();
         gCatFrame = (gCatFrame + 1) % 10;
         drawIdleCat(gCatFrame);
+        
+        // 趁待機動畫間隙，檢查並維護預連線
+        static uint32_t lastCheck = 0;
+        if (millis() - lastCheck > 5000) {
+            lastCheck = millis();
+            connectToGemini();
+        }
     }
 
     // 每 10 秒嘗試重連
@@ -1013,14 +1065,13 @@ void drawFortuneCard() {
         "一段話，40字內，繁體中文，句尾可以加「喵～」。",
         level);
 
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(15);
-    HTTPClient http;
-    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + String(cfgModel) + ":generateContent?key=" + String(cfgApiKey);
-    http.begin(client, url);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
+    if (WiFi.status() != WL_CONNECTED) {
+        displayMessage("No WiFi", 0xF800);
+        return;
+    }
+
+    connectToGemini(); // 確保已連線
+
     String payload = "{\"contents\":[{\"parts\":[{\"text\":\"" + String(prompt) + "\"}]}]}";
 
     int code = http.POST(payload);
@@ -1039,6 +1090,5 @@ void drawFortuneCard() {
         Serial.println(http.getString());
         displayMessage("API 錯誤\n" + String(code), 0xF800);
     }
-    http.end();
 }
 
