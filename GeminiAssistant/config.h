@@ -1,13 +1,9 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// [重要] 現在建議優先使用 SD 卡設定方案：
-// 在 SD 卡根目錄建立 config.txt，內容參考 config.txt.example。
-// 
-// 以下為「最後退路值」(Fallback values) —— 僅在以下情況使用：
-// 1. SD 卡內無 config.txt
-// 2. 且尚未透過 BLE (NVS) 設定過連線資訊
-// -------------------------------------------------------
+// [說明] 本檔案為系統預設設定檔。
+// 您可以直接在此修改連線資訊，或是（推薦）在 SD 卡根目錄使用 config.txt。
+// 設定優先級：SD 卡 config.txt > NVS (BLE) > 本檔案預設值。
 
 // WiFi 連線預設值
 #define DEFAULT_SSID     "YOUR_WIFI_SSID"

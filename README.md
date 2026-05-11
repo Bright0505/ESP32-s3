@@ -15,27 +15,28 @@
 
 - **按下 BOOT**：抽今日運勢（大吉 / 吉 / 中吉 / 小吉 / 末吉 / 凶 / 大凶）
 - 貓咪 AI 大姐姐以繁體中文解讀運勢（霞鶩文楷 TTF）
-- 待機時播放 ASCII 貓咪動畫（眨眼、耳朵動、舔爪、尾巴擺動）
+- 待機時播放 ASCII 貓咪動畫，同時顯示 **比特幣挖礦統計** (Hashrate, Shares, etc.)
+- **效能優化**：字體 PSRAM 預載入與 HTTP 長連線，解籤回應僅需 2-5 秒
 - 結果顯示 1 分鐘後自動回到待機動畫
 - WiFi 狀態圓點即時顯示（右上角，綠/黃/紅）
 - 開機自檢畫面（SD / WiFi / Font 三步驟）
 
 ## 快速開始
 
-### 1. 設定 config.h
+### 1. 設定連線資訊 (二選一)
 
-```bash
-cp GeminiAssistant/config.h.example GeminiAssistant/config.h
+#### A. 使用 SD 卡 (推薦)
+在 SD 卡根目錄建立 `config.txt`，內容參考 `GeminiAssistant/config.txt.example`：
+```text
+SSID="您的 WiFi 名稱"
+PASS="您的 WiFi 密碼"
+API_KEY="您的 Gemini API Key"
+MODEL="gemini-1.5-flash"
+BTC_ADDR="您的比特幣地址"
 ```
 
-編輯 `GeminiAssistant/config.h`，填入：
-
-```cpp
-const char* ssid     = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-const char* apiKey   = "YOUR_GEMINI_API_KEY";
-const char* model    = "gemini-3-flash-preview";
-```
+#### B. 硬寫入程式碼
+直接編輯 `GeminiAssistant/config.h` 並填入對應資訊。
 
 > API Key 申請：https://aistudio.google.com/apikey
 
@@ -48,41 +49,45 @@ const char* model    = "gemini-3-flash-preview";
 
 ### 3. 編譯並燒錄
 
+**注意：** 本專案因整合 NerdMiner 與字體優化，必須使用 `PartitionScheme=huge_app` 分區表。
+
 ```bash
-# 編譯（FQBN 需包含 CDCOnBoot=cdc，否則 Serial 無輸出）
-arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi --output-dir build GeminiAssistant/
+# 編譯
+arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=huge_app --output-dir build GeminiAssistant/
 
 # 燒錄
-arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi --port /dev/cu.usbmodem1101 --input-dir build GeminiAssistant/
+arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=huge_app --port /dev/cu.usbmodem1101 --input-dir build GeminiAssistant/
 ```
 
-> 若上傳失敗，請先按住 BOOT → 按 RESET → 放開 RESET → 放開 BOOT 進入燒錄模式。
+### 4. Serial Monitor (除錯與監控)
 
-### 4. 首次啟動
+燒錄後可使用內附的 `monitor.py` 觀察日誌與挖礦狀態。裝置開機後會等待 3 秒供 Serial 連接。
+
+```bash
+python3 monitor.py
+```
+
+### 5. 首次啟動
 
 裝置會依序自檢：
 1. **SD Card** — 需已插入並格式化為 FAT32
-2. **WiFi** — 連線至 config.h 中設定的 AP
-3. **Font** — 若 `/font.ttf` 不存在或損毀，自動從 GitHub 下載霞鶩文楷（約 5MB）
+2. **Config** — 自動讀取 SD 卡或內部儲存的設定
+3. **WiFi** — 連線至網路；成功後自動啟動背景挖礦
+4. **Font** — 若 `/font.ttf` 不存在，自動下載並**載入至 PSRAM** 以加速渲染
 
-自檢完成後進入貓咪待機動畫，按 BOOT 即可抽籤。
-
-## BLE 設定（feat/ble-provisioning 分支）
+## BLE 設定
 
 WiFi 連線失敗時裝置自動進入 BLE 配對模式，使用手機 BLE UART app 傳送 JSON 填入設定：
 
 ```json
-{"ssid":"MyWiFi","pass":"password","key":"AIzaSy...","model":"gemini-2.0-flash"}
+{"ssid":"MyWiFi","pass":"password","key":"AIzaSy...","model":"gemini-1.5-flash"}
 ```
 
-設定儲存至 NVS，重啟後自動連線，無需重新燒錄。相容 **nRF Toolbox**（iOS/Android）、**Serial Bluetooth Terminal**（Android）等免費 app。
-
-> ⚠️ **安全提醒**：BLE 傳輸未加密，API Key 以明文傳送。請在私人環境下操作，避免在公共場所進行配對。
+設定儲存至 NVS，重啟後自動連線。
 
 ## AI 模型
 
-透過 [Google Gemini API](https://ai.google.dev/) 生成運勢內容，預設使用 `gemini-3-flash-preview`。
-可在 `GeminiAssistant/config.h` 中修改 `model` 欄位替換為其他 Gemini 模型。
+透過 [Google Gemini API](https://ai.google.dev/) 生成內容，建議使用 `gemini-1.5-flash`。
 
 ## 致謝
 
