@@ -8,10 +8,17 @@
 #include <Wire.h>
 #include <SD.h>
 #include <SPI.h>
+#include "esp_mac.h"
 #include "OpenFontRender.h"
 #include "ofrfs/M5Stack_SD_Preset.h"
 #include "XPowersLib.h"
 #include "config.h"
+
+// Runtime config — SD > config.h fallback
+char cfgSsid[64];
+char cfgPass[64];
+char cfgApiKey[128];
+char cfgModel[64];
 
 /* Display (QSPI) */
 #define LCD_SDIO0  4
@@ -49,6 +56,28 @@ OpenFontRender render;
 SPIClass sdSPI(HSPI);
 bool fontLoaded = false;
 GFXcanvas16 *msgCanvas = nullptr;
+
+// Gemini API Persistent Connection
+WiFiClientSecure client;
+HTTPClient http;
+bool httpConnected = false;
+
+void connectToGemini() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (httpConnected && http.connected()) return;
+
+    Serial.println("[HTTP] Establishing persistent connection to Gemini...");
+    client.setInsecure();
+    client.setTimeout(10);
+    
+    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + String(cfgModel) + ":generateContent?key=" + String(cfgApiKey);
+    
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Connection", "keep-alive");
+    http.setTimeout(15000);
+    httpConnected = true;
+}
 
 // 待機貓咪動畫
 static int      gCatFrame     = 0;
@@ -627,7 +656,52 @@ void drawWifiIcon() {
     gfx->fillCircle(448, 20, 5, ok ? 0x07E0 : 0xF800);
 }
 
-// ── Setup ───────────────────────────────────────────────
+void loadConfigFromSD() {
+    // 預填 config.h 的預設值
+    strlcpy(cfgSsid,   ssid,     sizeof(cfgSsid));
+    strlcpy(cfgPass,   password, sizeof(cfgPass));
+    strlcpy(cfgApiKey, apiKey,   sizeof(cfgApiKey));
+    strlcpy(cfgModel,  model,    sizeof(cfgModel));
+
+    if (!SD.exists("/config.txt")) {
+        Serial.println("[SD] No config.txt found, using fallback from config.h");
+        return;
+    }
+
+    File f = SD.open("/config.txt", FILE_READ);
+    if (!f) {
+        Serial.println("[SD] Failed to open config.txt");
+        return;
+    }
+
+    Serial.println("[SD] Loading config from /config.txt...");
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0 || line.startsWith("#")) continue;
+
+        int eq = line.indexOf('=');
+        if (eq > 0) {
+            String key = line.substring(0, eq);
+            String val = line.substring(eq + 1);
+            key.trim();
+            val.trim();
+
+            if (val.startsWith("\"") && val.endsWith("\"")) {
+                val = val.substring(1, val.length() - 1);
+            }
+
+            if (key == "SSID")           strlcpy(cfgSsid,   val.c_str(), sizeof(cfgSsid));
+            else if (key == "PASS")      strlcpy(cfgPass,   val.c_str(), sizeof(cfgPass));
+            else if (key == "API_KEY")   strlcpy(cfgApiKey, val.c_str(), sizeof(cfgApiKey));
+            else if (key == "MODEL")     strlcpy(cfgModel,  val.c_str(), sizeof(cfgModel));
+            
+            Serial.printf("[SD] Key: %s found\n", key.c_str());
+        }
+    }
+    f.close();
+    Serial.printf("[SD] Final Config: SSID=%s  Model=%s\n", cfgSsid, cfgModel);
+}
 void setup() {
     Serial.begin(115200);
     // 等待 USB-CDC terminal 連線（最多 3 秒），確保 Serial 輸出不遺失
@@ -635,10 +709,10 @@ void setup() {
     while (!Serial && millis() - t0 < 3000) delay(10);
 
     Wire.begin(IIC_SDA, IIC_SCL);
-    Wire.beginTransmission(0x34); Wire.write(0x90); Wire.write(0xBF); Wire.endTransmission();
-    Wire.beginTransmission(0x34); Wire.write(0x92); Wire.write(0x1C); Wire.endTransmission();
-    Wire.beginTransmission(0x34); Wire.write(0x93); Wire.write(0x1C); Wire.endTransmission();
-    Wire.beginTransmission(0x34); Wire.write(0x94); Wire.write(0x1C); Wire.endTransmission();
+    if (power.begin(Wire, AXP2101_SLAVE_ADDRESS, IIC_SDA, IIC_SCL)) {
+        power.setALDO2Voltage(3300); power.enableALDO2(); // LCD VDD
+        power.setBLDO1Voltage(3300); power.enableBLDO1(); // Backlight/Display
+    }
     delay(500);
 
     gfx->begin();
@@ -649,7 +723,7 @@ void setup() {
     setRowStatus(ROW_SD, BS_CHECKING);
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI);
     delay(200);
-    bool sdOk = SD.begin(SD_CS, sdSPI, 4000000);
+    bool sdOk = SD.begin(SD_CS, sdSPI, 20000000); // 提升至 20MHz
     if (sdOk) {
         char info[32];
         snprintf(info, sizeof(info), "%lluMB", SD.cardSize() / (1024*1024));
@@ -658,16 +732,18 @@ void setup() {
     } else {
         setRowStatus(ROW_SD, BS_FAIL, "Check wiring & format");
         Serial.println("SD FAIL");
-        while (true) delay(1000);  // 無法繼續，停在這裡
+        while (true) delay(1000);
     }
+
+    loadConfigFromSD();
 
     // ── Step 2: WiFi ──
     setRowStatus(ROW_WIFI, BS_CHECKING);
-    WiFi.begin(ssid, password);
+    WiFi.begin(cfgSsid, cfgPass);
     int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries++ < 60) {  // 30秒
+    while (WiFi.status() != WL_CONNECTED && tries++ < 60) {
         delay(500);
-        if (tries % 10 == 0) {  // 每5秒顯示進度
+        if (tries % 10 == 0) {
             char prog[20]; snprintf(prog, sizeof(prog), "Trying %d/30s", tries/2);
             setRowStatus(ROW_WIFI, BS_CHECKING, prog);
         }
@@ -676,10 +752,10 @@ void setup() {
     if (wifiOk) {
         setRowStatus(ROW_WIFI, BS_OK, WiFi.localIP().toString().c_str());
         Serial.printf("WiFi OK  %s\n", WiFi.localIP().toString().c_str());
+        connectToGemini();
     } else {
         setRowStatus(ROW_WIFI, BS_FAIL, "Check SSID/Password");
         Serial.println("WiFi FAIL");
-        // WiFi 失敗但 SD 有字型仍可嘗試載入
     }
 
     // ── Step 3: Font ──
@@ -697,64 +773,46 @@ void setup() {
         }
     }
 
-    // 顯示字型檔資訊，零位元組直接刪除重下（避免 loadFont 卡死）
+    // 讀取字型並載入 PSRAM
     File fi = SD.open(FONT_PATH, FILE_READ);
     uint32_t fsize = fi ? fi.size() : 0;
-    if (fi) fi.close();
-    Serial.printf("Font file size: %lu bytes\n", fsize);
-    Serial.flush();
-
-    if (fsize < 1000) {
-        SD.remove(FONT_PATH);
-        setRowStatus(ROW_FONT, BS_FAIL, "Bad font, re-downloading...");
-        Serial.println("Font too small, re-downloading");
-        if (!wifiOk) { while (true) delay(1000); }
-        if (!downloadFont()) {
-            setProgress("Press BOOT to retry");
-            while (digitalRead(0) != LOW) delay(100);
-            ESP.restart();
+    uint8_t* fontBuffer = nullptr;
+    if (fi) {
+        if (psramFound()) {
+            setProgress("Loading font to PSRAM...");
+            fontBuffer = (uint8_t*)ps_malloc(fsize);
+            if (fontBuffer) {
+                fi.read(fontBuffer, fsize);
+                Serial.printf("Font loaded to PSRAM: %lu bytes\n", fsize);
+            }
         }
-        fi = SD.open(FONT_PATH, FILE_READ);
-        fsize = fi ? fi.size() : 0;
-        if (fi) fi.close();
-        Serial.printf("Re-downloaded font size: %lu bytes\n", fsize);
-        Serial.flush();
+        fi.close();
     }
 
-    char finfo[48];
-    snprintf(finfo, sizeof(finfo), "File: %luKB", fsize / 1024);
-    setProgress(finfo);
-    delay(500);
-
     render.setDrawer(*gfx);
-    Serial.printf("Free internal heap: %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    Serial.printf("Free PSRAM:         %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    Serial.printf("Loading font from SD (%luKB)...\n", fsize / 1024);
-    Serial.flush();
-    int fontErr = render.loadFont(FONT_PATH);
+    int fontErr = -1;
+    if (fontBuffer) {
+        fontErr = render.loadFont(fontBuffer, fsize);
+    } else {
+        Serial.printf("Loading font from SD (%luKB)...\n", fsize / 1024);
+        fontErr = render.loadFont(FONT_PATH);
+    }
+    
     Serial.printf("render.loadFont returned: %d\n", fontErr);
     Serial.flush();
     if (fontErr != 0) {
-        // 字型載入失敗：刪除後讓用戶手動按 BOOT 重啟重下
-        // 不自動重試，避免無限下載循環
         char errMsg[48];
         snprintf(errMsg, sizeof(errMsg), "FT err %d  %luKB", fontErr, fsize / 1024);
         setRowStatus(ROW_FONT, BS_FAIL, errMsg);
-        setProgress("Delete & BOOT to retry");
-        Serial.printf("Font load failed: FT error %d, file %lu bytes\n", fontErr, fsize);
-        Serial.flush();
-        SD.remove(FONT_PATH);  // 刪掉，下次開機重下
+        SD.remove(FONT_PATH);
         while (digitalRead(0) != LOW) delay(100);
         ESP.restart();
     }
     fontLoaded = true;
-    setRowStatus(ROW_FONT, BS_OK, "LXGWWenKaiTC");
+    setRowStatus(ROW_FONT, BS_OK, "Done");
     setProgress("Press BOOT to start");
-    Serial.println("Font OK — waiting for BOOT button");
     while (digitalRead(0) != LOW) delay(50);
-    while (digitalRead(0) == LOW)  delay(50);  // 等放開
-
-    // ── 立即顯示主待機畫面（按鍵說明）──
+    while (digitalRead(0) == LOW)  delay(50);
     drawIdleCat(0);
 }
 
@@ -773,6 +831,13 @@ void loop() {
         gLastCatFrame = millis();
         gCatFrame = (gCatFrame + 1) % 10;
         drawIdleCat(gCatFrame);
+        
+        // 趁待機動畫間隙，檢查並維護預連線
+        static uint32_t lastCheck = 0;
+        if (millis() - lastCheck > 5000) {
+            lastCheck = millis();
+            connectToGemini();
+        }
     }
 
     // 每 10 秒嘗試重連
@@ -830,14 +895,13 @@ void drawFortuneCard() {
         "一段話，40字內，繁體中文，句尾可以加「喵～」。",
         level);
 
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(15);
-    HTTPClient http;
-    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + String(model) + ":generateContent?key=" + String(apiKey);
-    http.begin(client, url);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
+    if (WiFi.status() != WL_CONNECTED) {
+        displayMessage("No WiFi", 0xF800);
+        return;
+    }
+
+    connectToGemini(); // 確保已連線
+
     String payload = "{\"contents\":[{\"parts\":[{\"text\":\"" + String(prompt) + "\"}]}]}";
 
     int code = http.POST(payload);
@@ -856,6 +920,5 @@ void drawFortuneCard() {
         Serial.println(http.getString());
         displayMessage("API 錯誤\n" + String(code), 0xF800);
     }
-    http.end();
 }
 
