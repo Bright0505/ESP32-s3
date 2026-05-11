@@ -707,7 +707,52 @@ void loadConfig() {
     ba.toCharArray(cfgBtcAddr,  sizeof(cfgBtcAddr));
     pl.toCharArray(cfgPool,     sizeof(cfgPool));
     pp.toCharArray(cfgPoolPort, sizeof(cfgPoolPort));
-    Serial.printf("Config: SSID=%s  pool=%s:%s\n", cfgSsid, cfgPool, cfgPoolPort);
+    Serial.printf("NVS Config: SSID=%s  pool=%s:%s\n", cfgSsid, cfgPool, cfgPoolPort);
+}
+
+void loadConfigFromSD() {
+    if (!SD.exists("/config.txt")) {
+        Serial.println("[SD] No config.txt found, skipping.");
+        return;
+    }
+
+    File f = SD.open("/config.txt", FILE_READ);
+    if (!f) {
+        Serial.println("[SD] Failed to open config.txt");
+        return;
+    }
+
+    Serial.println("[SD] Loading config from /config.txt...");
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0 || line.startsWith("#")) continue;
+
+        int eq = line.indexOf('=');
+        if (eq > 0) {
+            String key = line.substring(0, eq);
+            String val = line.substring(eq + 1);
+            key.trim();
+            val.trim();
+
+            // 處理帶引號的值
+            if (val.startsWith("\"") && val.endsWith("\"")) {
+                val = val.substring(1, val.length() - 1);
+            }
+
+            if (key == "SSID")      strlcpy(cfgSsid, val.c_str(), sizeof(cfgSsid));
+            else if (key == "PASS") strlcpy(cfgPass, val.c_str(), sizeof(cfgPass));
+            else if (key == "API_KEY") strlcpy(cfgApiKey, val.c_str(), sizeof(cfgApiKey));
+            else if (key == "MODEL")   strlcpy(cfgModel, val.c_str(), sizeof(cfgModel));
+            else if (key == "BTC_ADDR") strlcpy(cfgBtcAddr, val.c_str(), sizeof(cfgBtcAddr));
+            else if (key == "POOL")     strlcpy(cfgPool, val.c_str(), sizeof(cfgPool));
+            else if (key == "PORT")     strlcpy(cfgPoolPort, val.c_str(), sizeof(cfgPoolPort));
+            
+            Serial.printf("[SD] Key: %s found\n", key.c_str());
+        }
+    }
+    f.close();
+    Serial.printf("[SD] Final Config: SSID=%s pool=%s:%s\n", cfgSsid, cfgPool, cfgPoolPort);
 }
 
 // ── BLE Provisioning（Nordic UART Service）──────────────
@@ -863,6 +908,7 @@ void setup() {
     }
 
     loadConfig(); // NVS → config.h fallback
+    loadConfigFromSD(); // SD Priority
 
     // ── Step 2: WiFi ──
     setRowStatus(ROW_WIFI, BS_CHECKING);

@@ -1,0 +1,18 @@
+# Gemini Buddy 設定檔範例
+# -------------------------------
+# 將此檔案改名為 config.txt 並放置於 SD 卡根目錄。
+# 此檔案的設定優先級最高，會覆蓋 NVS (BLE) 與程式內建的預設值。
+# 格式為 KEY=VALUE，若值包含空格請使用引號。
+
+# WiFi 連線設定
+SSID="YOUR_WIFI_SSID"
+PASS="YOUR_WIFI_PASSWORD"
+
+# Gemini API 設定
+API_KEY="YOUR_GEMINI_API_KEY"
+MODEL="gemini-1.5-flash"
+
+# 比特幣挖礦設定 (NerdMiner)
+BTC_ADDR="YOUR_BTC_ADDRESS"
+POOL="public-pool.io"
+PORT="21496"
